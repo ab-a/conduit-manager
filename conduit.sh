@@ -1122,17 +1122,8 @@ show_dashboard() {
         local snap_file="$INSTALL_DIR/traffic_stats/tracker_snapshot"
         local data_file="$INSTALL_DIR/traffic_stats/cumulative_data"
         if [ -s "$snap_file" ] || [ -s "$data_file" ]; then
-            # Get actual total connected clients from docker logs
-            local dash_clients=0
-            local dash_ps=$(docker ps --format '{{.Names}}' 2>/dev/null)
-            for ci in $(seq 1 $CONTAINER_COUNT); do
-                local cname=$(get_container_name $ci)
-                if echo "$dash_ps" | grep -q "^${cname}$"; then
-                    local lg=$(docker logs --tail 50 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
-                    local cn=$(echo "$lg" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
-                    [[ "$cn" =~ ^[0-9]+$ ]] && dash_clients=$((dash_clients + cn))
-                fi
-            done
+            # Reuse connected count from show_status (already cached)
+            local dash_clients=${_total_connected:-0}
 
             # Left column: Active Clients per country (estimated from snapshot distribution)
             local left_lines=()
@@ -1164,13 +1155,14 @@ show_dashboard() {
             # Right column: Top 5 Upload (cumulative outbound bytes per country)
             local right_lines=()
             if [ -s "$data_file" ]; then
-                local top5_upload
-                top5_upload=$(awk -F'|' '{if($1!="" && $3+0>0) print $3"|"$1}' "$data_file" 2>/dev/null | sort -t'|' -k1 -nr | head -5)
+                local all_upload
+                all_upload=$(awk -F'|' '{if($1!="" && $3+0>0) print $3"|"$1}' "$data_file" 2>/dev/null | sort -t'|' -k1 -nr)
+                local top5_upload=$(echo "$all_upload" | head -5)
                 local total_upload=0
-                if [ -n "$top5_upload" ]; then
+                if [ -n "$all_upload" ]; then
                     while IFS='|' read -r bytes co; do
                         total_upload=$((total_upload + bytes))
-                    done < <(awk -F'|' '{if($1!="" && $3+0>0) print $3"|"$1}' "$data_file" 2>/dev/null)
+                    done <<< "$all_upload"
                 fi
                 [ "$total_upload" -eq 0 ] && total_upload=1
                 if [ -n "$top5_upload" ]; then
@@ -1233,51 +1225,35 @@ show_dashboard() {
 get_container_stats() {
     # Get CPU and RAM usage across all conduit containers
     # Returns: "CPU_PERCENT RAM_USAGE"
-    if [ "$CONTAINER_COUNT" -le 1 ]; then
-        local stats=$(docker stats --no-stream --format "{{.CPUPerc}} {{.MemUsage}}" conduit 2>/dev/null)
-        if [ -z "$stats" ]; then
-            echo "0% 0MiB"
-        else
-            echo "$stats"
-        fi
+    # Single docker stats call for all containers at once
+    local names=""
+    for i in $(seq 1 $CONTAINER_COUNT); do
+        names+=" $(get_container_name $i)"
+    done
+    local all_stats=$(docker stats --no-stream --format "{{.CPUPerc}} {{.MemUsage}}" $names 2>/dev/null)
+    if [ -z "$all_stats" ]; then
+        echo "0% 0MiB"
+    elif [ "$CONTAINER_COUNT" -le 1 ]; then
+        echo "$all_stats"
     else
-        # Aggregate stats across all containers
-        local total_cpu=0
-        local total_mem=0
-        local mem_limit=""
-        local any_found=false
-        for i in $(seq 1 $CONTAINER_COUNT); do
-            local name=$(get_container_name $i)
-            local stats=$(docker stats --no-stream --format "{{.CPUPerc}} {{.MemUsage}}" "$name" 2>/dev/null)
-            if [ -n "$stats" ]; then
-                any_found=true
-                local cpu=$(echo "$stats" | awk '{print $1}' | tr -d '%')
-                total_cpu=$(awk -v a="$total_cpu" -v b="$cpu" 'BEGIN{printf "%.2f", a+b}')
-                # Parse mem: "123.4MiB / 1.5GiB"
-                local mem_used=$(echo "$stats" | awk '{print $2}')
-                if [ -z "$mem_limit" ]; then
-                    mem_limit=$(echo "$stats" | awk '{print $4}')
-                fi
-                # Convert to MiB for summing
-                local mem_val=$(echo "$mem_used" | sed 's/[^0-9.]//g')
-                if echo "$mem_used" | grep -qi "gib"; then
-                    mem_val=$(awk -v v="$mem_val" 'BEGIN{printf "%.1f", v*1024}')
-                fi
-                total_mem=$(awk -v a="$total_mem" -v b="$mem_val" 'BEGIN{printf "%.1f", a+b}')
-            fi
-        done
-        if [ "$any_found" = true ]; then
-            # Format mem back
-            local mem_display
-            if [ "$(echo "$total_mem" | awk '{print ($1 >= 1024)}')" = "1" ]; then
-                mem_display=$(awk -v m="$total_mem" 'BEGIN{printf "%.2fGiB", m/1024}')
-            else
-                mem_display="${total_mem}MiB"
-            fi
-            echo "${total_cpu}% ${mem_display} / ${mem_limit}"
-        else
-            echo "0% 0MiB"
-        fi
+        # Single awk to aggregate all container stats at once
+        echo "$all_stats" | awk '{
+            # CPU: strip % and sum
+            cpu = $1; gsub(/%/, "", cpu); total_cpu += cpu + 0
+            # Memory used: convert to MiB and sum
+            mem = $2; gsub(/[^0-9.]/, "", mem); mem += 0
+            if ($2 ~ /GiB/) mem *= 1024
+            else if ($2 ~ /KiB/) mem /= 1024
+            total_mem += mem
+            # Memory limit: take first one
+            if (mem_limit == "") mem_limit = $4
+            found = 1
+        } END {
+            if (!found) { print "0% 0MiB"; exit }
+            if (total_mem >= 1024) mem_display = sprintf("%.2fGiB", total_mem/1024)
+            else mem_display = sprintf("%.1fMiB", total_mem)
+            printf "%.2f%% %s / %s\n", total_cpu, mem_display, mem_limit
+        }'
     fi
 }
 
@@ -1329,24 +1305,29 @@ get_system_stats() {
     local sys_ram_pct="N/A"
     
     if command -v free &>/dev/null; then
-        # Output: used total percentage
-        local ram_data=$(free -m 2>/dev/null | awk '/^Mem:/{printf "%s %s %.2f%%", $3, $2, ($3/$2)*100}')
-        local ram_human=$(free -h 2>/dev/null | awk '/^Mem:/{print $3 " " $2}')
-        
-        sys_ram_used=$(echo "$ram_human" | awk '{print $1}')
-        sys_ram_total=$(echo "$ram_human" | awk '{print $2}')
-        sys_ram_pct=$(echo "$ram_data" | awk '{print $3}')
+        # Single free -m call: MiB values for percentage + display
+        local free_out=$(free -m 2>/dev/null)
+        if [ -n "$free_out" ]; then
+            read -r sys_ram_used sys_ram_total sys_ram_pct <<< $(echo "$free_out" | awk '/^Mem:/{
+                used_mb=$3; total_mb=$2
+                pct = (total_mb > 0) ? (used_mb/total_mb)*100 : 0
+                if (total_mb >= 1024) { total_str=sprintf("%.1fGiB", total_mb/1024) } else { total_str=sprintf("%.1fMiB", total_mb) }
+                if (used_mb >= 1024) { used_str=sprintf("%.1fGiB", used_mb/1024) } else { used_str=sprintf("%.1fMiB", used_mb) }
+                printf "%s %s %.2f%%", used_str, total_str, pct
+            }')
+        fi
     fi
     
     echo "$sys_cpu $sys_ram_used $sys_ram_total $sys_ram_pct"
 }
 
 show_live_stats() {
-    # Check if any container is running
+    # Check if any container is running (single docker ps call)
+    local ps_cache=$(docker ps --format '{{.Names}}' 2>/dev/null)
     local any_running=false
     for i in $(seq 1 $CONTAINER_COUNT); do
         local cname=$(get_container_name $i)
-        if docker ps 2>/dev/null | grep -q "[[:space:]]${cname}$"; then
+        if echo "$ps_cache" | grep -q "^${cname}$"; then
             any_running=true
             break
         fi
@@ -1379,7 +1360,7 @@ show_live_stats() {
         for i in $(seq 1 $CONTAINER_COUNT); do
             local cname=$(get_container_name $i)
             local status="${RED}Stopped${NC}"
-            docker ps 2>/dev/null | grep -q "[[:space:]]${cname}$" && status="${GREEN}Running${NC}"
+            echo "$ps_cache" | grep -q "^${cname}$" && status="${GREEN}Running${NC}"
             echo -e "  ${i}. ${cname}  [${status}]"
         done
         echo ""
@@ -1733,7 +1714,8 @@ show_advanced_stats() {
 
     while [ "$exit_stats" -eq 0 ]; do
         local now=$(date +%s)
-        local term_height=$(tput lines 2>/dev/null || echo 24)
+        local term_height=$(stty size </dev/tty 2>/dev/null | awk '{print $1}')
+        [ -z "$term_height" ] || [ "$term_height" -lt 10 ] 2>/dev/null && term_height=$(tput lines 2>/dev/null || echo "${LINES:-24}")
 
         local cycle_elapsed=$(( (now - cycle_start) % 15 ))
         local time_until_next=$((15 - cycle_elapsed))
@@ -1762,16 +1744,28 @@ show_advanced_stats() {
             local total_mem_mib=0 first_mem_limit=""
 
             echo -e "${CYAN}║${NC} ${GREEN}CONTAINER${NC}  ${DIM}|${NC}  ${YELLOW}NETWORK${NC}  ${DIM}|${NC}  ${MAGENTA}TRACKER${NC}\033[K"
+
+            # Single docker stats call for all running containers
+            local adv_running_names=""
+            for ci in $(seq 1 $CONTAINER_COUNT); do
+                local cname=$(get_container_name $ci)
+                echo "$docker_ps_cache" | grep -q "^${cname}$" && adv_running_names+=" $cname"
+            done
+            local adv_all_stats=""
+            if [ -n "$adv_running_names" ]; then
+                adv_all_stats=$(docker stats --no-stream --format "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}" $adv_running_names 2>/dev/null)
+            fi
+
             for ci in $(seq 1 $CONTAINER_COUNT); do
                 local cname=$(get_container_name $ci)
                 if echo "$docker_ps_cache" | grep -q "^${cname}$"; then
                     container_count=$((container_count + 1))
 
-                    local stats=$(docker stats --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}" "$cname" 2>/dev/null)
-                    local cpu=$(echo "$stats" | cut -d'|' -f1 | tr -d '%')
+                    local stats=$(echo "$adv_all_stats" | grep "^${cname}|" 2>/dev/null)
+                    local cpu=$(echo "$stats" | cut -d'|' -f2 | tr -d '%')
                     [[ "$cpu" =~ ^[0-9.]+$ ]] && total_cpu=$(awk -v a="$total_cpu" -v b="$cpu" 'BEGIN{printf "%.2f", a+b}')
 
-                    local cmem_str=$(echo "$stats" | cut -d'|' -f2 | awk '{print $1}')
+                    local cmem_str=$(echo "$stats" | cut -d'|' -f3 | awk '{print $1}')
                     local cmem_val=$(echo "$cmem_str" | sed 's/[^0-9.]//g')
                     local cmem_unit=$(echo "$cmem_str" | sed 's/[0-9.]//g')
                     if [[ "$cmem_val" =~ ^[0-9.]+$ ]]; then
@@ -1781,7 +1775,7 @@ show_advanced_stats() {
                         esac
                         total_mem_mib=$(awk -v a="$total_mem_mib" -v b="$cmem_val" 'BEGIN{printf "%.2f", a+b}')
                     fi
-                    [ -z "$first_mem_limit" ] && first_mem_limit=$(echo "$stats" | cut -d'|' -f2 | awk -F'/' '{print $2}' | xargs)
+                    [ -z "$first_mem_limit" ] && first_mem_limit=$(echo "$stats" | cut -d'|' -f3 | awk -F'/' '{print $2}' | xargs)
 
                     local logs=$(docker logs --tail 50 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
                     local conn=$(echo "$logs" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
@@ -1961,7 +1955,8 @@ show_peers() {
 
     while [ $stop_peers -eq 0 ]; do
         local now=$(date +%s)
-        local term_height=$(tput lines 2>/dev/null || echo 24)
+        local term_height=$(stty size </dev/tty 2>/dev/null | awk '{print $1}')
+        [ -z "$term_height" ] || [ "$term_height" -lt 10 ] 2>/dev/null && term_height=$(tput lines 2>/dev/null || echo "${LINES:-24}")
         local cycle_elapsed=$(( (now - cycle_start) % 15 ))
         local time_left=$((15 - cycle_elapsed))
 
@@ -2185,24 +2180,36 @@ show_status() {
         if echo "$docker_ps_cache" | grep -q "[[:space:]]${cname}$"; then
             _c_running[$i]=true
             running_count=$((running_count + 1))
-            local logs=$(docker logs --tail 1000 "$cname" 2>&1 | grep "STATS" | tail -1)
+            local logs=$(docker logs --tail 50 "$cname" 2>&1 | grep "STATS" | tail -1)
             if [ -n "$logs" ]; then
-                local c_connecting=$(echo "$logs" | sed -n 's/.*Connecting:[[:space:]]*\([0-9]*\).*/\1/p')
-                local c_connected=$(echo "$logs" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
+                # Single awk to extract all 5 fields, pipe-delimited
+                IFS='|' read -r c_connecting c_connected c_up_val c_down_val c_uptime_val <<< $(echo "$logs" | awk '{
+                    cing=0; conn=0; up=""; down=""; ut=""
+                    for(j=1;j<=NF;j++){
+                        if($j=="Connecting:") cing=$(j+1)+0
+                        else if($j=="Connected:") conn=$(j+1)+0
+                        else if($j=="Up:"){for(k=j+1;k<=NF;k++){if($k=="|"||$k~/Down:/)break; up=up (up?" ":"") $k}}
+                        else if($j=="Down:"){for(k=j+1;k<=NF;k++){if($k=="|"||$k~/Uptime:/)break; down=down (down?" ":"") $k}}
+                        else if($j=="Uptime:"){for(k=j+1;k<=NF;k++){ut=ut (ut?" ":"") $k}}
+                    }
+                    printf "%d|%d|%s|%s|%s", cing, conn, up, down, ut
+                }')
                 _c_conn[$i]="${c_connected:-0}"
                 _c_cing[$i]="${c_connecting:-0}"
-                _c_up[$i]=$(echo "$logs" | sed -n 's/.*Up:[[:space:]]*\([^|]*\).*/\1/p' | xargs)
-                _c_down[$i]=$(echo "$logs" | sed -n 's/.*Down:[[:space:]]*\([^|]*\).*/\1/p' | xargs)
+                _c_up[$i]="${c_up_val}"
+                _c_down[$i]="${c_down_val}"
                 total_connecting=$((total_connecting + ${c_connecting:-0}))
                 total_connected=$((total_connected + ${c_connected:-0}))
                 if [ -z "$uptime" ]; then
-                    uptime=$(echo "$logs" | sed -n 's/.*Uptime:[[:space:]]*\(.*\)/\1/p' | xargs)
+                    uptime="${c_uptime_val}"
                 fi
             fi
         fi
     done
     local connecting=$total_connecting
     local connected=$total_connected
+    # Export for parent function to reuse (avoids duplicate docker logs calls)
+    _total_connected=$total_connected
 
     # Aggregate upload/download across all containers
     local upload=""
@@ -2824,6 +2831,20 @@ manage_containers() {
 
         # Per-container stats table
         local docker_ps_cache=$(docker ps --format '{{.Names}}' 2>/dev/null)
+
+        # Single docker stats call for all running containers (instead of per-container)
+        local all_dstats=""
+        local running_names=""
+        for ci in $(seq 1 $CONTAINER_COUNT); do
+            local cname=$(get_container_name $ci)
+            if echo "$docker_ps_cache" | grep -q "^${cname}$"; then
+                running_names+=" $cname"
+            fi
+        done
+        if [ -n "$running_names" ]; then
+            all_dstats=$(docker stats --no-stream --format "{{.Name}} {{.CPUPerc}} {{.MemUsage}}" $running_names 2>/dev/null)
+        fi
+
         printf "  ${BOLD}%-2s %-11s %-8s %-7s %-8s %-8s %-6s %-7s${NC}${EL}\n" \
             "#" "Container" "Status" "Clients" "Up" "Down" "CPU" "RAM"
         echo -e "  ${CYAN}─────────────────────────────────────────────────────────${NC}${EL}"
@@ -2837,20 +2858,28 @@ manage_containers() {
                 if echo "$docker_ps_cache" | grep -q "^${cname}$"; then
                     status_text="Running"
                     status_color="${GREEN}"
-                    local logs=$(docker logs --tail 1000 "$cname" 2>&1 | grep "STATS" | tail -1)
+                    local logs=$(docker logs --tail 50 "$cname" 2>&1 | grep "STATS" | tail -1)
                     if [ -n "$logs" ]; then
-                        local conn=$(echo "$logs" | sed -n 's/.*Connected:[[:space:]]*\([0-9]*\).*/\1/p')
-                        local cing=$(echo "$logs" | sed -n 's/.*Connecting:[[:space:]]*\([0-9]*\).*/\1/p')
+                        IFS='|' read -r conn cing mc_up mc_down <<< $(echo "$logs" | awk '{
+                            cing=0; conn=0; up=""; down=""
+                            for(j=1;j<=NF;j++){
+                                if($j=="Connecting:") cing=$(j+1)+0
+                                else if($j=="Connected:") conn=$(j+1)+0
+                                else if($j=="Up:"){for(k=j+1;k<=NF;k++){if($k=="|"||$k~/Down:/)break; up=up (up?" ":"") $k}}
+                                else if($j=="Down:"){for(k=j+1;k<=NF;k++){if($k=="|"||$k~/Uptime:/)break; down=down (down?" ":"") $k}}
+                            }
+                            printf "%d|%d|%s|%s", conn, cing, up, down
+                        }')
                         c_clients="${conn:-0}/${cing:-0}"
-                        c_up=$(echo "$logs" | sed -n 's/.*Up:[[:space:]]*\([^|]*\).*/\1/p' | xargs)
-                        c_down=$(echo "$logs" | sed -n 's/.*Down:[[:space:]]*\([^|]*\).*/\1/p' | xargs)
+                        c_up="${mc_up:-"-"}"
+                        c_down="${mc_down:-"-"}"
                         [ -z "$c_up" ] && c_up="-"
                         [ -z "$c_down" ] && c_down="-"
                     fi
-                    local dstats=$(docker stats --no-stream --format "{{.CPUPerc}} {{.MemUsage}}" "$cname" 2>/dev/null)
-                    if [ -n "$dstats" ]; then
-                        c_cpu=$(echo "$dstats" | awk '{print $1}')
-                        c_ram=$(echo "$dstats" | awk '{print $2}')
+                    local dstats_line=$(echo "$all_dstats" | grep "^${cname} " 2>/dev/null)
+                    if [ -n "$dstats_line" ]; then
+                        c_cpu=$(echo "$dstats_line" | awk '{print $2}')
+                        c_ram=$(echo "$dstats_line" | awk '{print $3}')
                     fi
                 else
                     status_text="Stopped"
@@ -4263,3 +4292,5 @@ main() {
 # REACHED END OF SCRIPT - VERSION 1.1
 # ###############################################################################
 main "$@"
+
+
