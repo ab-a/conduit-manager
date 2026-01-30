@@ -3191,8 +3191,18 @@ manage_containers() {
 
         echo -e "  ${CYAN}────────────────────────────────────────${NC}"
         echo -ne "\033[?25h"
+        local _mc_start=$(date +%s)
         read -t 5 -p "  Enter choice: " mc_choice < /dev/tty 2>/dev/null || { mc_choice=""; }
         echo -ne "\033[?25l"
+        local _mc_elapsed=$(( $(date +%s) - _mc_start ))
+
+        # If read failed instantly (not a 5s timeout), /dev/tty is broken
+        if [ -z "$mc_choice" ] && [ "$_mc_elapsed" -lt 2 ]; then
+            _mc_tty_fails=$(( ${_mc_tty_fails:-0} + 1 ))
+            [ "$_mc_tty_fails" -ge 3 ] && { echo -e "\n  ${RED}Input error. Cannot read from terminal.${NC}"; return; }
+        else
+            _mc_tty_fails=0
+        fi
 
         # Empty = just refresh
         [ -z "$mc_choice" ] && continue
@@ -5854,7 +5864,7 @@ main() {
         echo "  3. 🗑️  Uninstall"
         echo "  0. 🚪 Exit"
         echo ""
-        read -p "  Enter choice: " choice < /dev/tty || true
+        read -p "  Enter choice: " choice < /dev/tty || { echo -e "\n  ${RED}Input error. Cannot read from terminal. Exiting.${NC}"; exit 1; }
 
         case "$choice" in
             1)
