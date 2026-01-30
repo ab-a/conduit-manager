@@ -681,7 +681,7 @@ save_settings_install() {
     mkdir -p "$INSTALL_DIR"
     # Preserve existing Telegram settings on reinstall
     local _tg_token="" _tg_chat="" _tg_interval="6" _tg_enabled="false"
-    local _tg_alerts="true" _tg_daily="true" _tg_weekly="true"
+    local _tg_alerts="true" _tg_daily="true" _tg_weekly="true" _tg_label="" _tg_start_hour="0"
     if [ -f "$INSTALL_DIR/settings.conf" ]; then
         source "$INSTALL_DIR/settings.conf" 2>/dev/null
         _tg_token="${TELEGRAM_BOT_TOKEN:-}"
@@ -691,6 +691,8 @@ save_settings_install() {
         _tg_alerts="${TELEGRAM_ALERTS_ENABLED:-true}"
         _tg_daily="${TELEGRAM_DAILY_SUMMARY:-true}"
         _tg_weekly="${TELEGRAM_WEEKLY_SUMMARY:-true}"
+        _tg_label="${TELEGRAM_SERVER_LABEL:-}"
+        _tg_start_hour="${TELEGRAM_START_HOUR:-0}"
     fi
     cat > "$INSTALL_DIR/settings.conf" << EOF
 MAX_CLIENTS=$MAX_CLIENTS
@@ -708,6 +710,8 @@ TELEGRAM_ENABLED=$_tg_enabled
 TELEGRAM_ALERTS_ENABLED=$_tg_alerts
 TELEGRAM_DAILY_SUMMARY=$_tg_daily
 TELEGRAM_WEEKLY_SUMMARY=$_tg_weekly
+TELEGRAM_SERVER_LABEL="$_tg_label"
+TELEGRAM_START_HOUR=$_tg_start_hour
 EOF
 
     chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null || true
@@ -3531,6 +3535,8 @@ TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
 TELEGRAM_ALERTS_ENABLED=${TELEGRAM_ALERTS_ENABLED:-true}
 TELEGRAM_DAILY_SUMMARY=${TELEGRAM_DAILY_SUMMARY:-true}
 TELEGRAM_WEEKLY_SUMMARY=${TELEGRAM_WEEKLY_SUMMARY:-true}
+TELEGRAM_SERVER_LABEL="${TELEGRAM_SERVER_LABEL:-}"
+TELEGRAM_START_HOUR=${TELEGRAM_START_HOUR:-0}
 EOF
     # Save per-container overrides
     for i in $(seq 1 5); do
@@ -3558,6 +3564,15 @@ escape_telegram_markdown() {
 telegram_send_message() {
     local message="$1"
     { [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; } && return 1
+    # Prepend server label + IP (escape for Markdown)
+    local label="${TELEGRAM_SERVER_LABEL:-$(hostname 2>/dev/null || echo 'unknown')}"
+    label=$(escape_telegram_markdown "$label")
+    local _ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
+    if [ -n "$_ip" ]; then
+        message="[${label} | ${_ip}] ${message}"
+    else
+        message="[${label}] ${message}"
+    fi
     local response
     response=$(curl -s --max-time 10 --max-filesize 1048576 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
@@ -3770,8 +3785,21 @@ INSTALL_DIR="/opt/conduit"
 [ -z "$TELEGRAM_BOT_TOKEN" ] && exit 0
 [ -z "$TELEGRAM_CHAT_ID" ] && exit 0
 
+# Cache server IP once at startup
+_server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null \
+    || curl -s --max-time 5 https://ifconfig.me 2>/dev/null \
+    || echo "")
+
 telegram_send() {
     local message="$1"
+    # Prepend server label + IP (escape for Markdown)
+    local label="${TELEGRAM_SERVER_LABEL:-$(hostname 2>/dev/null || echo 'unknown')}"
+    label=$(escape_md "$label")
+    if [ -n "$_server_ip" ]; then
+        message="[${label} | ${_server_ip}] ${message}"
+    else
+        message="[${label}] ${message}"
+    fi
     curl -s --max-time 10 --max-filesize 1048576 -X POST \
         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
@@ -4228,7 +4256,6 @@ build_report() {
 }
 
 # State variables
-elapsed=0
 cpu_breach=0
 ram_breach=0
 zero_peers_since=0
@@ -4247,10 +4274,11 @@ last_daily_ts=$(cat "$_ts_dir/.last_daily_ts" 2>/dev/null || echo 0)
 [ "$last_daily_ts" -eq "$last_daily_ts" ] 2>/dev/null || last_daily_ts=0
 last_weekly_ts=$(cat "$_ts_dir/.last_weekly_ts" 2>/dev/null || echo 0)
 [ "$last_weekly_ts" -eq "$last_weekly_ts" ] 2>/dev/null || last_weekly_ts=0
+last_report_ts=$(cat "$_ts_dir/.last_report_ts" 2>/dev/null || echo 0)
+[ "$last_report_ts" -eq "$last_report_ts" ] 2>/dev/null || last_report_ts=0
 
 while true; do
     sleep 60
-    elapsed=$((elapsed + 60))
 
     # Re-read settings
     [ -f "$INSTALL_DIR/settings.conf" ] && source "$INSTALL_DIR/settings.conf"
@@ -4258,9 +4286,6 @@ while true; do
     # Exit if disabled
     [ "$TELEGRAM_ENABLED" != "true" ] && exit 0
     [ -z "$TELEGRAM_BOT_TOKEN" ] && exit 0
-
-    # Update interval
-    interval_secs=$(( ${TELEGRAM_INTERVAL:-6} * 3600 ))
 
     # Core per-minute tasks
     process_commands
@@ -4288,12 +4313,23 @@ while true; do
         echo "$now_ts" > "$_ts_dir/.last_weekly_ts"
     fi
 
-    # Regular periodic report
-    if [ "$elapsed" -ge "$interval_secs" ]; then
-        report=$(build_report)
-        telegram_send "$report"
-        record_snapshot
-        elapsed=0
+    # Regular periodic report (wall-clock aligned to start hour)
+    # Reports fire when current hour matches start_hour + N*interval
+    interval_hours=${TELEGRAM_INTERVAL:-6}
+    start_hour=${TELEGRAM_START_HOUR:-0}
+    interval_secs=$((interval_hours * 3600))
+    current_hour=$(date +%-H)
+    # Check if this hour is a scheduled slot: (current_hour - start_hour) mod interval == 0
+    hour_diff=$(( (current_hour - start_hour + 24) % 24 ))
+    if [ "$interval_hours" -gt 0 ] && [ $((hour_diff % interval_hours)) -eq 0 ] 2>/dev/null; then
+        # Only send once per slot (check if enough time passed since last report)
+        if [ $((now_ts - last_report_ts)) -ge $((interval_secs - 120)) ] 2>/dev/null; then
+            report=$(build_report)
+            telegram_send "$report"
+            record_snapshot
+            last_report_ts=$now_ts
+            echo "$now_ts" > "$_ts_dir/.last_report_ts"
+        fi
     fi
 done
 TGEOF
@@ -4538,7 +4574,8 @@ show_telegram_menu() {
             echo -e "${CYAN}  TELEGRAM NOTIFICATIONS${NC}"
             echo -e "${CYAN}─────────────────────────────────────────────────────────────────${NC}"
             echo ""
-            echo -e "  Status: ${GREEN}✓ Enabled${NC} (every ${TELEGRAM_INTERVAL}h)"
+            local _sh="${TELEGRAM_START_HOUR:-0}"
+            echo -e "  Status: ${GREEN}✓ Enabled${NC} (every ${TELEGRAM_INTERVAL}h starting at ${_sh}:00)"
             echo ""
             local alerts_st="${GREEN}ON${NC}"
             [ "${TELEGRAM_ALERTS_ENABLED:-true}" != "true" ] && alerts_st="${RED}OFF${NC}"
@@ -4553,6 +4590,8 @@ show_telegram_menu() {
             echo -e "  5. 🚨 Alerts (CPU/RAM/down):    ${alerts_st}"
             echo -e "  6. 📋 Daily summary:            ${daily_st}"
             echo -e "  7. 📊 Weekly summary:           ${weekly_st}"
+            local cur_label="${TELEGRAM_SERVER_LABEL:-$(hostname 2>/dev/null || echo 'unknown')}"
+            echo -e "  8. 🏷  Server label:            ${CYAN}${cur_label}${NC}"
             echo -e "  0. ← Back"
             echo -e "${CYAN}─────────────────────────────────────────────────────────────────${NC}"
             echo ""
@@ -4586,9 +4625,16 @@ show_telegram_menu() {
                         5) TELEGRAM_INTERVAL=24 ;;
                         *) echo -e "  ${RED}Invalid choice${NC}"; read -n 1 -s -r -p "  Press any key..." < /dev/tty || true; continue ;;
                     esac
+                    echo ""
+                    echo -e "  What hour should reports start? (0-23, e.g. 8 = 8:00 AM)"
+                    echo -e "  Reports will repeat every ${TELEGRAM_INTERVAL}h from this hour."
+                    read -p "  Start hour [0-23] (default ${TELEGRAM_START_HOUR:-0}): " shchoice < /dev/tty || true
+                    if [ -n "$shchoice" ] && [ "$shchoice" -ge 0 ] 2>/dev/null && [ "$shchoice" -le 23 ] 2>/dev/null; then
+                        TELEGRAM_START_HOUR=$shchoice
+                    fi
                     save_settings
                     telegram_start_notify
-                    echo -e "  ${GREEN}✓ Interval set to every ${TELEGRAM_INTERVAL} hours${NC}"
+                    echo -e "  ${GREEN}✓ Reports every ${TELEGRAM_INTERVAL}h starting at ${TELEGRAM_START_HOUR:-0}:00${NC}"
                     read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
                     ;;
                 3)
@@ -4637,6 +4683,21 @@ show_telegram_menu() {
                     telegram_start_notify
                     read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
                     ;;
+                8)
+                    echo ""
+                    local cur_label="${TELEGRAM_SERVER_LABEL:-$(hostname 2>/dev/null || echo 'unknown')}"
+                    echo -e "  Current label: ${CYAN}${cur_label}${NC}"
+                    echo -e "  This label appears in all Telegram messages to identify the server."
+                    echo -e "  Leave blank to use hostname ($(hostname 2>/dev/null || echo 'unknown'))"
+                    echo ""
+                    read -p "  New label: " new_label < /dev/tty || true
+                    TELEGRAM_SERVER_LABEL="${new_label}"
+                    save_settings
+                    telegram_start_notify
+                    local display_label="${TELEGRAM_SERVER_LABEL:-$(hostname 2>/dev/null || echo 'unknown')}"
+                    echo -e "  ${GREEN}✓ Server label set to: ${display_label}${NC}"
+                    read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
+                    ;;
                 0) return ;;
             esac
         elif [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
@@ -4680,7 +4741,9 @@ telegram_setup_wizard() {
     local _saved_chatid="$TELEGRAM_CHAT_ID"
     local _saved_interval="$TELEGRAM_INTERVAL"
     local _saved_enabled="$TELEGRAM_ENABLED"
-    trap 'TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"; trap - SIGINT; echo; return' SIGINT
+    local _saved_starthour="$TELEGRAM_START_HOUR"
+    local _saved_label="$TELEGRAM_SERVER_LABEL"
+    trap 'TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"; TELEGRAM_START_HOUR="$_saved_starthour"; TELEGRAM_SERVER_LABEL="$_saved_label"; trap - SIGINT; echo; return' SIGINT
     clear
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
     echo -e "              ${BOLD}TELEGRAM NOTIFICATIONS SETUP${NC}"
@@ -4717,7 +4780,7 @@ telegram_setup_wizard() {
     # Validate token format
     if ! echo "$TELEGRAM_BOT_TOKEN" | grep -qE '^[0-9]+:[A-Za-z0-9_-]+$'; then
         echo -e "  ${RED}Invalid token format. Should be like: 123456789:ABCdefGHI...${NC}"
-        TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"
+        TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"; TELEGRAM_START_HOUR="$_saved_starthour"; TELEGRAM_SERVER_LABEL="$_saved_label"
         read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
         trap - SIGINT; return
     fi
@@ -4729,7 +4792,7 @@ telegram_setup_wizard() {
     echo -e "  2. Send it the message: ${YELLOW}/start${NC}"
     echo -e "  3. Press Enter here when done..."
     echo ""
-    read -p "  Press Enter after sending /start to your bot... " < /dev/tty || { trap - SIGINT; TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"; return; }
+    read -p "  Press Enter after sending /start to your bot... " < /dev/tty || { trap - SIGINT; TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"; TELEGRAM_START_HOUR="$_saved_starthour"; TELEGRAM_SERVER_LABEL="$_saved_label"; return; }
 
     echo -ne "  Detecting chat ID... "
     local attempts=0
@@ -4745,7 +4808,7 @@ telegram_setup_wizard() {
     if [ -z "$TELEGRAM_CHAT_ID" ]; then
         echo -e "${RED}✗ Could not detect chat ID${NC}"
         echo -e "  Make sure you sent /start to the bot and try again."
-        TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"
+        TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"; TELEGRAM_START_HOUR="$_saved_starthour"; TELEGRAM_SERVER_LABEL="$_saved_label"
         read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
         trap - SIGINT; return
     fi
@@ -4770,12 +4833,25 @@ telegram_setup_wizard() {
     esac
 
     echo ""
+    echo -e "  ${BOLD}Step 4: Start Hour${NC}"
+    echo -e "  ${CYAN}─────────────────────────────${NC}"
+    echo -e "  What hour should reports start? (0-23, e.g. 8 = 8:00 AM)"
+    echo -e "  Reports will repeat every ${TELEGRAM_INTERVAL}h from this hour."
+    echo ""
+    read -p "  Start hour [0-23] (default 0): " shchoice < /dev/tty || true
+    if [ -n "$shchoice" ] && [ "$shchoice" -ge 0 ] 2>/dev/null && [ "$shchoice" -le 23 ] 2>/dev/null; then
+        TELEGRAM_START_HOUR=$shchoice
+    else
+        TELEGRAM_START_HOUR=0
+    fi
+
+    echo ""
     echo -ne "  Sending test message... "
     if telegram_test_message; then
         echo -e "${GREEN}✓ Success!${NC}"
     else
         echo -e "${RED}✗ Failed to send. Check your token.${NC}"
-        TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"
+        TELEGRAM_BOT_TOKEN="$_saved_token"; TELEGRAM_CHAT_ID="$_saved_chatid"; TELEGRAM_INTERVAL="$_saved_interval"; TELEGRAM_ENABLED="$_saved_enabled"; TELEGRAM_START_HOUR="$_saved_starthour"; TELEGRAM_SERVER_LABEL="$_saved_label"
         read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
         trap - SIGINT; return
     fi
@@ -4787,7 +4863,7 @@ telegram_setup_wizard() {
     trap - SIGINT
     echo ""
     echo -e "  ${GREEN}${BOLD}✓ Telegram notifications enabled!${NC}"
-    echo -e "  You'll receive reports every ${TELEGRAM_INTERVAL} hours."
+    echo -e "  You'll receive reports every ${TELEGRAM_INTERVAL}h starting at ${TELEGRAM_START_HOUR}:00."
     echo ""
     read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true
 }
