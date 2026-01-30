@@ -3579,7 +3579,8 @@ telegram_build_report() {
     report+=$'\n'
 
     # Container status & uptime (check all containers, use earliest start)
-    local running_count=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" || echo 0)
+    local running_count=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" 2>/dev/null || true)
+    running_count=${running_count:-0}
     local total=$CONTAINER_COUNT
     if [ "$running_count" -gt 0 ]; then
         local earliest_start=""
@@ -3746,7 +3747,8 @@ build_report() {
     report+=$'\n'
 
     # Container status + uptime
-    local running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" || echo 0)
+    local running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" 2>/dev/null || true)
+    running=${running:-0}
     local total=${CONTAINER_COUNT:-1}
     report+="📦 Containers: ${running}/${total} running"
     report+=$'\n'
@@ -5307,7 +5309,7 @@ main() {
     fi
 }
 #
-# REACHED END OF SCRIPT - VERSION 1.1
+# REACHED END OF SCRIPT - VERSION 1.2-Beta
 # ###############################################################################
 main "$@"
 
