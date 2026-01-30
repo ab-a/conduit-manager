@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ╔═══════════════════════════════════════════════════════════════════╗
-# ║        🚀 PSIPHON CONDUIT MANAGER v1.1                         ║
+# ║      🚀 PSIPHON CONDUIT MANAGER v1.2-Beta                         ║
 # ║                                                                   ║
 # ║  One-click setup for Psiphon Conduit                              ║
 # ║                                                                   ║
@@ -681,12 +681,16 @@ save_settings_install() {
     mkdir -p "$INSTALL_DIR"
     # Preserve existing Telegram settings on reinstall
     local _tg_token="" _tg_chat="" _tg_interval="6" _tg_enabled="false"
+    local _tg_alerts="true" _tg_daily="true" _tg_weekly="true"
     if [ -f "$INSTALL_DIR/settings.conf" ]; then
         source "$INSTALL_DIR/settings.conf" 2>/dev/null
         _tg_token="${TELEGRAM_BOT_TOKEN:-}"
         _tg_chat="${TELEGRAM_CHAT_ID:-}"
         _tg_interval="${TELEGRAM_INTERVAL:-6}"
         _tg_enabled="${TELEGRAM_ENABLED:-false}"
+        _tg_alerts="${TELEGRAM_ALERTS_ENABLED:-true}"
+        _tg_daily="${TELEGRAM_DAILY_SUMMARY:-true}"
+        _tg_weekly="${TELEGRAM_WEEKLY_SUMMARY:-true}"
     fi
     cat > "$INSTALL_DIR/settings.conf" << EOF
 MAX_CLIENTS=$MAX_CLIENTS
@@ -701,6 +705,9 @@ TELEGRAM_BOT_TOKEN="$_tg_token"
 TELEGRAM_CHAT_ID="$_tg_chat"
 TELEGRAM_INTERVAL=$_tg_interval
 TELEGRAM_ENABLED=$_tg_enabled
+TELEGRAM_ALERTS_ENABLED=$_tg_alerts
+TELEGRAM_DAILY_SUMMARY=$_tg_daily
+TELEGRAM_WEEKLY_SUMMARY=$_tg_weekly
 EOF
 
     chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null || true
@@ -1533,7 +1540,9 @@ if [ "$container_start" != "$stored_start" ]; then
         [ -s "$IPS_FILE" ] && cp "$IPS_FILE" "$PERSIST_DIR/cumulative_ips.bak"
         [ -s "$GEOIP_CACHE" ] && cp "$GEOIP_CACHE" "$PERSIST_DIR/geoip_cache.bak"
     fi
-    rm -f "$STATS_FILE" "$IPS_FILE" "$SNAPSHOT_FILE"
+    rm -f "$STATS_FILE" "$IPS_FILE"
+    # Note: Don't clear SNAPSHOT_FILE here — keep stale speed data visible
+    # until the first 15-second capture cycle replaces it atomically
     # Restore cumulative data (keep historical totals across restarts)
     if [ -f "$PERSIST_DIR/cumulative_data.bak" ]; then
         cp "$PERSIST_DIR/cumulative_data.bak" "$STATS_FILE"
@@ -1591,7 +1600,7 @@ process_batch() {
     done < "$PERSIST_DIR/batch_ips"
 
     # Step 2: Single awk pass — merge batch into cumulative_data + write snapshot
-    $AWK_BIN -F'|' -v snap="$SNAPSHOT_FILE" '
+    $AWK_BIN -F'|' -v snap="${SNAPSHOT_TMP:-$SNAPSHOT_FILE}" '
         BEGIN { OFMT = "%.0f"; CONVFMT = "%.0f" }
         FILENAME == ARGV[1] { geo[$1] = $2; next }
         FILENAME == ARGV[2] { existing[$1] = $2 "|" $3; next }
@@ -1741,8 +1750,11 @@ while true; do
             if [ "$line" = "SYNC_MARKER" ]; then
                 # Process entire batch at once
                 if [ -s "$BATCH_FILE" ]; then
-                    > "$SNAPSHOT_FILE"
-                    process_batch "$BATCH_FILE"
+                    > "${SNAPSHOT_FILE}.new"
+                    SNAPSHOT_TMP="${SNAPSHOT_FILE}.new"
+                    if process_batch "$BATCH_FILE" && [ -s "${SNAPSHOT_FILE}.new" ]; then
+                        mv -f "${SNAPSHOT_FILE}.new" "$SNAPSHOT_FILE"
+                    fi
                 fi
                 > "$BATCH_FILE"
                 # Periodic backup every 3 hours
@@ -2693,22 +2705,68 @@ restart_conduit() {
     fi
 
     echo "Restarting Conduit ($CONTAINER_COUNT container(s))..."
-    local any_found=false
     for i in $(seq 1 $CONTAINER_COUNT); do
         local name=$(get_container_name $i)
         local vol=$(get_volume_name $i)
-        if docker ps -a 2>/dev/null | grep -q "[[:space:]]${name}$"; then
-            any_found=true
-            docker stop "$name" 2>/dev/null || true
-            docker rm "$name" 2>/dev/null || true
-        fi
-        docker volume create "$vol" 2>/dev/null || true
-        fix_volume_permissions $i
-        run_conduit_container $i
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✓ ${name} restarted${NC}"
+        local want_mc=$(get_container_max_clients $i)
+        local want_bw=$(get_container_bandwidth $i)
+
+        if docker ps 2>/dev/null | grep -q "[[:space:]]${name}$"; then
+            # Container is running — check if settings match
+            local cur_args=$(docker inspect --format '{{join .Args " "}}' "$name" 2>/dev/null)
+            local needs_recreate=false
+            # Check if max-clients or bandwidth args differ (portable, no -oP)
+            local cur_mc=$(echo "$cur_args" | sed -n 's/.*--max-clients \([^ ]*\).*/\1/p' 2>/dev/null)
+            local cur_bw=$(echo "$cur_args" | sed -n 's/.*--bandwidth \([^ ]*\).*/\1/p' 2>/dev/null)
+            [ "$cur_mc" != "$want_mc" ] && needs_recreate=true
+            [ "$cur_bw" != "$want_bw" ] && needs_recreate=true
+
+            if [ "$needs_recreate" = true ]; then
+                echo "Settings changed for ${name}, recreating..."
+                docker stop "$name" 2>/dev/null || true
+                docker rm "$name" 2>/dev/null || true
+                docker volume create "$vol" 2>/dev/null || true
+                fix_volume_permissions $i
+                run_conduit_container $i
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ ${name} recreated with new settings${NC}"
+                else
+                    echo -e "${RED}✗ Failed to recreate ${name}${NC}"
+                fi
+            else
+                docker restart "$name" 2>/dev/null
+                echo -e "${GREEN}✓ ${name} restarted (settings unchanged)${NC}"
+            fi
+        elif docker ps -a 2>/dev/null | grep -q "[[:space:]]${name}$"; then
+            # Container exists but stopped — check if settings match
+            local cur_args=$(docker inspect --format '{{join .Args " "}}' "$name" 2>/dev/null)
+            local cur_mc=$(echo "$cur_args" | sed -n 's/.*--max-clients \([^ ]*\).*/\1/p' 2>/dev/null)
+            local cur_bw=$(echo "$cur_args" | sed -n 's/.*--bandwidth \([^ ]*\).*/\1/p' 2>/dev/null)
+            if [ "$cur_mc" != "$want_mc" ] || [ "$cur_bw" != "$want_bw" ]; then
+                echo "Settings changed for ${name}, recreating..."
+                docker rm "$name" 2>/dev/null || true
+                docker volume create "$vol" 2>/dev/null || true
+                fix_volume_permissions $i
+                run_conduit_container $i
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ ${name} recreated with new settings${NC}"
+                else
+                    echo -e "${RED}✗ Failed to recreate ${name}${NC}"
+                fi
+            else
+                docker start "$name" 2>/dev/null
+                echo -e "${GREEN}✓ ${name} started${NC}"
+            fi
         else
-            echo -e "${RED}✗ Failed to restart ${name}${NC}"
+            # Container doesn't exist — create fresh
+            docker volume create "$vol" 2>/dev/null || true
+            fix_volume_permissions $i
+            run_conduit_container $i
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ ${name} created and started${NC}"
+            else
+                echo -e "${RED}✗ Failed to create ${name}${NC}"
+            fi
         fi
     done
     # Remove extra containers beyond current count
@@ -2720,7 +2778,8 @@ restart_conduit() {
             echo -e "${YELLOW}✓ ${name} removed (scaled down)${NC}"
         fi
     done
-    # Backup tracker data before regenerating
+    # Stop tracker before backup to avoid racing with writes
+    stop_tracker_service 2>/dev/null || true
     local persist_dir="$INSTALL_DIR/traffic_stats"
     if [ -s "$persist_dir/cumulative_data" ] || [ -s "$persist_dir/cumulative_ips" ]; then
         echo -e "${CYAN}⟳ Saving tracker data snapshot...${NC}"
@@ -2729,11 +2788,8 @@ restart_conduit() {
         [ -s "$persist_dir/geoip_cache" ] && cp "$persist_dir/geoip_cache" "$persist_dir/geoip_cache.bak"
         echo -e "${GREEN}✓ Tracker data snapshot saved${NC}"
     fi
-    # Regenerate tracker script and restart tracker service
-    regenerate_tracker_script
-    if command -v systemctl &>/dev/null && systemctl is-active --quiet conduit-tracker.service 2>/dev/null; then
-        systemctl restart conduit-tracker.service 2>/dev/null || true
-    fi
+    # Regenerate tracker script and ensure service is running
+    setup_tracker_service 2>/dev/null || true
 }
 
 change_settings() {
@@ -3472,6 +3528,9 @@ TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID"
 TELEGRAM_INTERVAL=${TELEGRAM_INTERVAL:-6}
 TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
+TELEGRAM_ALERTS_ENABLED=${TELEGRAM_ALERTS_ENABLED:-true}
+TELEGRAM_DAILY_SUMMARY=${TELEGRAM_DAILY_SUMMARY:-true}
+TELEGRAM_WEEKLY_SUMMARY=${TELEGRAM_WEEKLY_SUMMARY:-true}
 EOF
     # Save per-container overrides
     for i in $(seq 1 5); do
@@ -3611,6 +3670,18 @@ telegram_build_report() {
     report+="📦 Containers: ${running_count}/${total} running"
     report+=$'\n'
 
+    # Uptime percentage from uptime_log
+    local uptime_log="$INSTALL_DIR/traffic_stats/uptime_log"
+    if [ -s "$uptime_log" ]; then
+        local total_entries=$(wc -l < "$uptime_log" 2>/dev/null || echo 0)
+        local up_entries=$(awk -F'|' '$2+0>0' "$uptime_log" 2>/dev/null | wc -l)
+        if [ "$total_entries" -gt 0 ] 2>/dev/null; then
+            local uptime_pct=$(awk "BEGIN {printf \"%.1f\", ($up_entries/$total_entries)*100}" 2>/dev/null || echo "0")
+            report+="📈 Availability: ${uptime_pct}% (last ${total_entries}m)"
+            report+=$'\n'
+        fi
+    fi
+
     # Connected peers (use awk like show_status does)
     local total_peers=0
     for i in $(seq 1 $CONTAINER_COUNT); do
@@ -3739,6 +3810,299 @@ get_cpu_cores() {
     echo "$cores"
 }
 
+track_uptime() {
+    local running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" 2>/dev/null || true)
+    running=${running:-0}
+    echo "$(date +%s)|${running}" >> "$INSTALL_DIR/traffic_stats/uptime_log"
+    # Trim to 10080 lines (7 days of per-minute entries)
+    local log_file="$INSTALL_DIR/traffic_stats/uptime_log"
+    local lines=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+    if [ "$lines" -gt 10080 ] 2>/dev/null; then
+        tail -10080 "$log_file" > "${log_file}.tmp" && mv "${log_file}.tmp" "$log_file"
+    fi
+}
+
+calc_uptime_pct() {
+    local period_secs=${1:-86400}
+    local log_file="$INSTALL_DIR/traffic_stats/uptime_log"
+    [ ! -s "$log_file" ] && echo "0" && return
+    local cutoff=$(( $(date +%s) - period_secs ))
+    local total=0
+    local up=0
+    while IFS='|' read -r ts count; do
+        [ "$ts" -lt "$cutoff" ] 2>/dev/null && continue
+        total=$((total + 1))
+        [ "$count" -gt 0 ] 2>/dev/null && up=$((up + 1))
+    done < "$log_file"
+    [ "$total" -eq 0 ] && echo "0" && return
+    awk "BEGIN {printf \"%.1f\", ($up/$total)*100}" 2>/dev/null || echo "0"
+}
+
+rotate_cumulative_data() {
+    local data_file="$INSTALL_DIR/traffic_stats/cumulative_data"
+    local marker="$INSTALL_DIR/traffic_stats/.last_rotation_month"
+    local current_month=$(date '+%Y-%m')
+    local last_month=""
+    [ -f "$marker" ] && last_month=$(cat "$marker" 2>/dev/null)
+    # First run: just set the marker, don't archive
+    if [ -z "$last_month" ]; then
+        echo "$current_month" > "$marker"
+        return
+    fi
+    if [ "$current_month" != "$last_month" ] && [ -s "$data_file" ]; then
+        cp "$data_file" "${data_file}.${last_month}"
+        echo "$current_month" > "$marker"
+        # Delete archives older than 3 months (portable: 90 days in seconds)
+        local cutoff_ts=$(( $(date +%s) - 7776000 ))
+        for archive in "$INSTALL_DIR/traffic_stats/cumulative_data."[0-9][0-9][0-9][0-9]-[0-9][0-9]; do
+            [ ! -f "$archive" ] && continue
+            local archive_mtime=$(stat -c %Y "$archive" 2>/dev/null || stat -f %m "$archive" 2>/dev/null || echo 0)
+            if [ "$archive_mtime" -gt 0 ] && [ "$archive_mtime" -lt "$cutoff_ts" ] 2>/dev/null; then
+                rm -f "$archive"
+            fi
+        done
+    fi
+}
+
+check_alerts() {
+    [ "$TELEGRAM_ALERTS_ENABLED" != "true" ] && return
+    local now=$(date +%s)
+    local cooldown=3600
+
+    # CPU + RAM check (single docker stats call)
+    local conduit_containers=$(docker ps --format '{{.Names}}' 2>/dev/null | grep "^conduit" 2>/dev/null || true)
+    local stats_line=""
+    if [ -n "$conduit_containers" ]; then
+        stats_line=$(timeout 10 docker stats --no-stream --format "{{.CPUPerc}} {{.MemPerc}}" $conduit_containers 2>/dev/null | head -1)
+    fi
+    local raw_cpu=$(echo "$stats_line" | awk '{print $1}')
+    local ram_pct=$(echo "$stats_line" | awk '{print $2}')
+
+    local cores=$(get_cpu_cores)
+    local cpu_val=$(awk "BEGIN {printf \"%.0f\", ${raw_cpu%\%} / $cores}" 2>/dev/null || echo 0)
+    if [ "${cpu_val:-0}" -gt 90 ] 2>/dev/null; then
+        cpu_breach=$((cpu_breach + 1))
+    else
+        cpu_breach=0
+    fi
+    if [ "$cpu_breach" -ge 3 ] && [ $((now - last_alert_cpu)) -ge $cooldown ] 2>/dev/null; then
+        telegram_send "⚠️ *Alert: High CPU*
+CPU usage at ${cpu_val}% for 3\\+ minutes"
+        last_alert_cpu=$now
+        cpu_breach=0
+    fi
+
+    local ram_val=${ram_pct%\%}
+    ram_val=${ram_val%%.*}
+    if [ "${ram_val:-0}" -gt 90 ] 2>/dev/null; then
+        ram_breach=$((ram_breach + 1))
+    else
+        ram_breach=0
+    fi
+    if [ "$ram_breach" -ge 3 ] && [ $((now - last_alert_ram)) -ge $cooldown ] 2>/dev/null; then
+        telegram_send "⚠️ *Alert: High RAM*
+Memory usage at ${ram_pct} for 3\\+ minutes"
+        last_alert_ram=$now
+        ram_breach=0
+    fi
+
+    # All containers down
+    local running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" 2>/dev/null || true)
+    running=${running:-0}
+    if [ "$running" -eq 0 ] 2>/dev/null && [ $((now - last_alert_down)) -ge $cooldown ] 2>/dev/null; then
+        telegram_send "🔴 *Alert: All containers down*
+No Conduit containers are running\\!"
+        last_alert_down=$now
+    fi
+
+    # Zero peers for 2+ hours
+    local total_peers=0
+    for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+        local cname=$(get_container_name $i)
+        local last_stat=$(timeout 5 docker logs --tail 50 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
+        total_peers=$((total_peers + ${peers:-0}))
+    done
+    if [ "$total_peers" -eq 0 ] 2>/dev/null; then
+        if [ "$zero_peers_since" -eq 0 ] 2>/dev/null; then
+            zero_peers_since=$now
+        elif [ $((now - zero_peers_since)) -ge 7200 ] && [ $((now - last_alert_peers)) -ge $cooldown ] 2>/dev/null; then
+            telegram_send "⚠️ *Alert: Zero peers*
+No connected peers for 2\\+ hours"
+            last_alert_peers=$now
+            zero_peers_since=$now
+        fi
+    else
+        zero_peers_since=0
+    fi
+}
+
+record_snapshot() {
+    local running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^conduit" 2>/dev/null || true)
+    running=${running:-0}
+    local total_peers=0
+    for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+        local cname=$(get_container_name $i)
+        local last_stat=$(docker logs --tail 50 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+        local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
+        total_peers=$((total_peers + ${peers:-0}))
+    done
+    local data_file="$INSTALL_DIR/traffic_stats/cumulative_data"
+    local total_bw=0
+    [ -s "$data_file" ] && total_bw=$(awk -F'|' '{s+=$2+$3} END{print s+0}' "$data_file" 2>/dev/null)
+    echo "$(date +%s)|${total_peers}|${total_bw:-0}|${running}" >> "$INSTALL_DIR/traffic_stats/report_snapshots"
+    # Trim to 720 entries
+    local snap_file="$INSTALL_DIR/traffic_stats/report_snapshots"
+    local lines=$(wc -l < "$snap_file" 2>/dev/null || echo 0)
+    if [ "$lines" -gt 720 ] 2>/dev/null; then
+        tail -720 "$snap_file" > "${snap_file}.tmp" && mv "${snap_file}.tmp" "$snap_file"
+    fi
+}
+
+build_summary() {
+    local period_label="$1"
+    local period_secs="$2"
+    local snap_file="$INSTALL_DIR/traffic_stats/report_snapshots"
+    [ ! -s "$snap_file" ] && return
+    local cutoff=$(( $(date +%s) - period_secs ))
+    local peak_peers=0
+    local sum_peers=0
+    local count=0
+    local first_bw=0
+    local last_bw=0
+    local got_first=false
+    while IFS='|' read -r ts peers bw running; do
+        [ "$ts" -lt "$cutoff" ] 2>/dev/null && continue
+        count=$((count + 1))
+        sum_peers=$((sum_peers + ${peers:-0}))
+        [ "${peers:-0}" -gt "$peak_peers" ] 2>/dev/null && peak_peers=${peers:-0}
+        if [ "$got_first" = false ]; then
+            first_bw=${bw:-0}
+            got_first=true
+        fi
+        last_bw=${bw:-0}
+    done < "$snap_file"
+    [ "$count" -eq 0 ] && return
+
+    local avg_peers=$((sum_peers / count))
+    local period_bw=$((${last_bw:-0} - ${first_bw:-0}))
+    [ "$period_bw" -lt 0 ] 2>/dev/null && period_bw=0
+    local bw_fmt=$(awk "BEGIN {b=$period_bw; if(b>1099511627776) printf \"%.2f TB\",b/1099511627776; else if(b>1073741824) printf \"%.2f GB\",b/1073741824; else printf \"%.1f MB\",b/1048576}" 2>/dev/null)
+    local uptime_pct=$(calc_uptime_pct "$period_secs")
+
+    # New countries detection
+    local countries_file="$INSTALL_DIR/traffic_stats/known_countries"
+    local data_file="$INSTALL_DIR/traffic_stats/cumulative_data"
+    local new_countries=""
+    if [ -s "$data_file" ]; then
+        local current_countries=$(awk -F'|' '{if($1!="") print $1}' "$data_file" 2>/dev/null | sort -u)
+        if [ -f "$countries_file" ]; then
+            new_countries=$(comm -23 <(echo "$current_countries") <(sort "$countries_file") 2>/dev/null | head -5 | tr '\n' ', ' | sed 's/,$//')
+        fi
+        echo "$current_countries" > "$countries_file"
+    fi
+
+    local msg="📋 *${period_label} Summary*"
+    msg+=$'\n'
+    msg+="🕐 $(date '+%Y-%m-%d %H:%M %Z')"
+    msg+=$'\n'
+    msg+=$'\n'
+    msg+="📊 Bandwidth served: ${bw_fmt}"
+    msg+=$'\n'
+    msg+="👥 Peak peers: ${peak_peers} | Avg: ${avg_peers}"
+    msg+=$'\n'
+    msg+="⏱ Uptime: ${uptime_pct}%"
+    msg+=$'\n'
+    msg+="📈 Data points: ${count}"
+    if [ -n "$new_countries" ]; then
+        local safe_new=$(escape_md "$new_countries")
+        msg+=$'\n'"🆕 New countries: ${safe_new}"
+    fi
+
+    telegram_send "$msg"
+}
+
+process_commands() {
+    local offset_file="$INSTALL_DIR/traffic_stats/last_update_id"
+    local offset=0
+    [ -f "$offset_file" ] && offset=$(cat "$offset_file" 2>/dev/null)
+    offset=${offset:-0}
+    # Ensure numeric
+    [ "$offset" -eq "$offset" ] 2>/dev/null || offset=0
+
+    local response
+    response=$(curl -s --max-time 10 --max-filesize 1048576 \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$((offset + 1))&timeout=0" 2>/dev/null)
+    [ -z "$response" ] && return
+
+    # Parse with python3 if available, otherwise skip
+    if ! command -v python3 &>/dev/null; then
+        return
+    fi
+
+    local parsed
+    parsed=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    if not data.get('ok'): sys.exit(0)
+    results = data.get('result', [])
+    if not results: sys.exit(0)
+    for r in results:
+        uid = r.get('update_id', 0)
+        msg = r.get('message', {})
+        chat_id = msg.get('chat', {}).get('id', 0)
+        text = msg.get('text', '')
+        if str(chat_id) == '$TELEGRAM_CHAT_ID' and text.startswith('/'):
+            print(f'{uid}|{text}')
+        else:
+            print(f'{uid}|')
+except Exception:
+    # On parse failure, try to extract max update_id to avoid re-fetching
+    try:
+        data = json.loads(sys.argv[1])
+        results = data.get('result', [])
+        if results:
+            max_uid = max(r.get('update_id', 0) for r in results)
+            if max_uid > 0:
+                print(f'{max_uid}|')
+    except Exception:
+        pass
+" "$response" 2>/dev/null)
+
+    [ -z "$parsed" ] && return
+
+    local max_id=$offset
+    while IFS='|' read -r uid cmd; do
+        [ -z "$uid" ] && continue
+        [ "$uid" -gt "$max_id" ] 2>/dev/null && max_id=$uid
+        case "$cmd" in
+            /status|/status@*)
+                local report=$(build_report)
+                telegram_send "$report"
+                ;;
+            /peers|/peers@*)
+                local total_peers=0
+                for i in $(seq 1 ${CONTAINER_COUNT:-1}); do
+                    local cname=$(get_container_name $i)
+                    local last_stat=$(timeout 5 docker logs --tail 50 "$cname" 2>&1 | grep "\[STATS\]" | tail -1)
+                    local peers=$(echo "$last_stat" | awk '{for(j=1;j<=NF;j++){if($j=="Connected:") print $(j+1)+0}}' | head -1)
+                    total_peers=$((total_peers + ${peers:-0}))
+                done
+                telegram_send "👥 Peers: ${total_peers} connected"
+                ;;
+            /help|/help@*)
+                telegram_send "📖 *Available Commands*
+/status — Full status report
+/peers — Current peer count
+/help — Show this help"
+                ;;
+        esac
+    done <<< "$parsed"
+
+    [ "$max_id" -gt "$offset" ] 2>/dev/null && echo "$max_id" > "$offset_file"
+}
+
 build_report() {
     local report="📊 *Conduit Status Report*"
     report+=$'\n'
@@ -3752,6 +4116,18 @@ build_report() {
     local total=${CONTAINER_COUNT:-1}
     report+="📦 Containers: ${running}/${total} running"
     report+=$'\n'
+
+    # Uptime percentage
+    local uptime_log="$INSTALL_DIR/traffic_stats/uptime_log"
+    if [ -s "$uptime_log" ]; then
+        local total_entries=$(wc -l < "$uptime_log" 2>/dev/null || echo 0)
+        local up_entries=$(awk -F'|' '$2+0>0' "$uptime_log" 2>/dev/null | wc -l)
+        if [ "$total_entries" -gt 0 ] 2>/dev/null; then
+            local uptime_pct=$(awk "BEGIN {printf \"%.1f\", ($up_entries/$total_entries)*100}" 2>/dev/null || echo "0")
+            report+="📈 Availability: ${uptime_pct}% (last ${total_entries}m)"
+            report+=$'\n'
+        fi
+    fi
 
     # Uptime from earliest container
     local earliest_start=""
@@ -3851,9 +4227,26 @@ build_report() {
     echo "$report"
 }
 
-# Main loop
+# State variables
 elapsed=0
-interval_secs=$(( ${TELEGRAM_INTERVAL:-6} * 3600 ))
+cpu_breach=0
+ram_breach=0
+zero_peers_since=0
+last_alert_cpu=0
+last_alert_ram=0
+last_alert_down=0
+last_alert_peers=0
+last_rotation_ts=0
+
+# Ensure data directory exists
+mkdir -p "$INSTALL_DIR/traffic_stats"
+
+# Persist daily/weekly timestamps across restarts
+_ts_dir="$INSTALL_DIR/traffic_stats"
+last_daily_ts=$(cat "$_ts_dir/.last_daily_ts" 2>/dev/null || echo 0)
+[ "$last_daily_ts" -eq "$last_daily_ts" ] 2>/dev/null || last_daily_ts=0
+last_weekly_ts=$(cat "$_ts_dir/.last_weekly_ts" 2>/dev/null || echo 0)
+[ "$last_weekly_ts" -eq "$last_weekly_ts" ] 2>/dev/null || last_weekly_ts=0
 
 while true; do
     sleep 60
@@ -3869,9 +4262,37 @@ while true; do
     # Update interval
     interval_secs=$(( ${TELEGRAM_INTERVAL:-6} * 3600 ))
 
+    # Core per-minute tasks
+    process_commands
+    track_uptime
+    check_alerts
+
+    # Daily rotation check (once per day, using wall-clock time)
+    now_ts=$(date +%s)
+    if [ $((now_ts - last_rotation_ts)) -ge 86400 ] 2>/dev/null; then
+        rotate_cumulative_data
+        last_rotation_ts=$now_ts
+    fi
+
+    # Daily summary (wall-clock, survives restarts)
+    if [ "${TELEGRAM_DAILY_SUMMARY:-true}" = "true" ] && [ $((now_ts - last_daily_ts)) -ge 86400 ] 2>/dev/null; then
+        build_summary "Daily" 86400
+        last_daily_ts=$now_ts
+        echo "$now_ts" > "$_ts_dir/.last_daily_ts"
+    fi
+
+    # Weekly summary (wall-clock, survives restarts)
+    if [ "${TELEGRAM_WEEKLY_SUMMARY:-true}" = "true" ] && [ $((now_ts - last_weekly_ts)) -ge 604800 ] 2>/dev/null; then
+        build_summary "Weekly" 604800
+        last_weekly_ts=$now_ts
+        echo "$now_ts" > "$_ts_dir/.last_weekly_ts"
+    fi
+
+    # Regular periodic report
     if [ "$elapsed" -ge "$interval_secs" ]; then
         report=$(build_report)
         telegram_send "$report"
+        record_snapshot
         elapsed=0
     fi
 done
@@ -4119,10 +4540,19 @@ show_telegram_menu() {
             echo ""
             echo -e "  Status: ${GREEN}✓ Enabled${NC} (every ${TELEGRAM_INTERVAL}h)"
             echo ""
+            local alerts_st="${GREEN}ON${NC}"
+            [ "${TELEGRAM_ALERTS_ENABLED:-true}" != "true" ] && alerts_st="${RED}OFF${NC}"
+            local daily_st="${GREEN}ON${NC}"
+            [ "${TELEGRAM_DAILY_SUMMARY:-true}" != "true" ] && daily_st="${RED}OFF${NC}"
+            local weekly_st="${GREEN}ON${NC}"
+            [ "${TELEGRAM_WEEKLY_SUMMARY:-true}" != "true" ] && weekly_st="${RED}OFF${NC}"
             echo -e "  1. 📩 Send test message"
             echo -e "  2. ⏱  Change interval"
             echo -e "  3. ❌ Disable notifications"
             echo -e "  4. 🔄 Reconfigure (new bot/chat)"
+            echo -e "  5. 🚨 Alerts (CPU/RAM/down):    ${alerts_st}"
+            echo -e "  6. 📋 Daily summary:            ${daily_st}"
+            echo -e "  7. 📊 Weekly summary:           ${weekly_st}"
             echo -e "  0. ← Back"
             echo -e "${CYAN}─────────────────────────────────────────────────────────────────${NC}"
             echo ""
@@ -4170,6 +4600,42 @@ show_telegram_menu() {
                     ;;
                 4)
                     telegram_setup_wizard
+                    ;;
+                5)
+                    if [ "${TELEGRAM_ALERTS_ENABLED:-true}" = "true" ]; then
+                        TELEGRAM_ALERTS_ENABLED=false
+                        echo -e "  ${RED}✗ Alerts disabled${NC}"
+                    else
+                        TELEGRAM_ALERTS_ENABLED=true
+                        echo -e "  ${GREEN}✓ Alerts enabled${NC}"
+                    fi
+                    save_settings
+                    telegram_start_notify
+                    read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
+                    ;;
+                6)
+                    if [ "${TELEGRAM_DAILY_SUMMARY:-true}" = "true" ]; then
+                        TELEGRAM_DAILY_SUMMARY=false
+                        echo -e "  ${RED}✗ Daily summary disabled${NC}"
+                    else
+                        TELEGRAM_DAILY_SUMMARY=true
+                        echo -e "  ${GREEN}✓ Daily summary enabled${NC}"
+                    fi
+                    save_settings
+                    telegram_start_notify
+                    read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
+                    ;;
+                7)
+                    if [ "${TELEGRAM_WEEKLY_SUMMARY:-true}" = "true" ]; then
+                        TELEGRAM_WEEKLY_SUMMARY=false
+                        echo -e "  ${RED}✗ Weekly summary disabled${NC}"
+                    else
+                        TELEGRAM_WEEKLY_SUMMARY=true
+                        echo -e "  ${GREEN}✓ Weekly summary enabled${NC}"
+                    fi
+                    save_settings
+                    telegram_start_notify
+                    read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
                     ;;
                 0) return ;;
             esac
@@ -4816,6 +5282,44 @@ health_check() {
         echo -e "${YELLOW}PENDING${NC} - Will be created on first run"
     fi
 
+    # Tracker service check
+    echo ""
+    echo -e "${CYAN}--- Tracker ---${NC}"
+    echo -n "Tracker service:      "
+    if is_tracker_active; then
+        echo -e "${GREEN}OK${NC} (active)"
+    else
+        echo -e "${RED}FAILED${NC} - Tracker service not running"
+        echo -e "         Fix: Settings → Restart tracker (option r)"
+        all_ok=false
+    fi
+
+    echo -n "tcpdump installed:    "
+    if command -v tcpdump &>/dev/null; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${RED}FAILED${NC} - tcpdump not found (tracker won't work)"
+        all_ok=false
+    fi
+
+    echo -n "GeoIP available:      "
+    if command -v geoiplookup &>/dev/null; then
+        echo -e "${GREEN}OK${NC} (geoiplookup)"
+    elif command -v mmdblookup &>/dev/null; then
+        echo -e "${GREEN}OK${NC} (mmdblookup)"
+    else
+        echo -e "${YELLOW}WARN${NC} - No GeoIP tool found (countries show as Unknown)"
+    fi
+
+    echo -n "Tracker data:         "
+    local tracker_data="$INSTALL_DIR/traffic_stats/cumulative_data"
+    if [ -s "$tracker_data" ]; then
+        local country_count=$(awk -F'|' '{if($1!="") c[$1]=1} END{print length(c)}' "$tracker_data" 2>/dev/null || echo 0)
+        echo -e "${GREEN}OK${NC} (${country_count} countries tracked)"
+    else
+        echo -e "${YELLOW}NONE${NC} - No traffic data yet"
+    fi
+
     echo ""
     if [ "$all_ok" = true ]; then
         echo -e "${GREEN}✓ All health checks passed${NC}"
@@ -5025,6 +5529,17 @@ update_conduit() {
     echo ""
     echo "Recreating container(s) with updated image..."
 
+    # Stop tracker before backup to avoid racing with writes
+    stop_tracker_service 2>/dev/null || true
+    local persist_dir="$INSTALL_DIR/traffic_stats"
+    if [ -s "$persist_dir/cumulative_data" ] || [ -s "$persist_dir/cumulative_ips" ]; then
+        echo -e "${CYAN}⟳ Saving tracker data snapshot...${NC}"
+        [ -s "$persist_dir/cumulative_data" ] && cp "$persist_dir/cumulative_data" "$persist_dir/cumulative_data.bak"
+        [ -s "$persist_dir/cumulative_ips" ] && cp "$persist_dir/cumulative_ips" "$persist_dir/cumulative_ips.bak"
+        [ -s "$persist_dir/geoip_cache" ] && cp "$persist_dir/geoip_cache" "$persist_dir/geoip_cache.bak"
+        echo -e "${GREEN}✓ Tracker data snapshot saved${NC}"
+    fi
+
     # Remove and recreate all containers
     for i in $(seq 1 $CONTAINER_COUNT); do
         local name=$(get_container_name $i)
@@ -5040,6 +5555,17 @@ update_conduit() {
             echo -e "${RED}✗ Failed to start $(get_container_name $i)${NC}"
         fi
     done
+    setup_tracker_service 2>/dev/null || true
+
+    # Regenerate Telegram script if enabled (picks up new features)
+    if [ -f "$INSTALL_DIR/settings.conf" ]; then
+        source "$INSTALL_DIR/settings.conf"
+        if [ "$TELEGRAM_ENABLED" = "true" ]; then
+            telegram_generate_notify_script 2>/dev/null || true
+            systemctl restart conduit-telegram 2>/dev/null || true
+            echo -e "${GREEN}✓ Telegram service updated${NC}"
+        fi
+    fi
 }
 
 case "${1:-menu}" in
@@ -5258,6 +5784,14 @@ main() {
             1)
                 echo -e "${CYAN}Updating management script and opening menu...${NC}"
                 create_management_script
+                # Regenerate Telegram script if enabled (picks up new features)
+                if [ -f "$INSTALL_DIR/settings.conf" ]; then
+                    source "$INSTALL_DIR/settings.conf"
+                    if [ "$TELEGRAM_ENABLED" = "true" ]; then
+                        telegram_generate_notify_script 2>/dev/null || true
+                        systemctl restart conduit-telegram 2>/dev/null || true
+                    fi
+                fi
                 exec "$INSTALL_DIR/conduit" menu
                 ;;
             2)
@@ -5322,6 +5856,7 @@ main() {
     log_info "Step 4/5: Setting up auto-start..."
     save_settings_install
     setup_autostart
+    setup_tracker_service 2>/dev/null || true
 
     echo ""
 
