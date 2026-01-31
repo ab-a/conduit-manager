@@ -5441,7 +5441,7 @@ telegram_setup_wizard() {
     echo -e "  outbound connections to api.telegram.org from this server."
     echo -e "  This traffic may be visible to your network provider."
     echo ""
-    read -s -p "  Enter your bot token: " TELEGRAM_BOT_TOKEN < /dev/tty || { trap - SIGINT; TELEGRAM_BOT_TOKEN="$_saved_token"; return; }
+    read -p "  Enter your bot token: " TELEGRAM_BOT_TOKEN < /dev/tty || { trap - SIGINT; TELEGRAM_BOT_TOKEN="$_saved_token"; return; }
     echo ""
     # Trim whitespace
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN## }"
