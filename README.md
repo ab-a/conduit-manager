@@ -44,7 +44,7 @@ sudo bash conduit.sh
 ## What's New in v1.2
 
 - **Per-Container Resource Limits** — Set CPU and memory limits per container via Settings menu with smart defaults
-- **Telegram Bot Integration** — Periodic status reports, alerts, and container management commands (`/containers`, `/restart_N`, `/stop_N`, `/start_N`)
+- **Telegram Bot Integration** — Periodic status reports, alerts, and commands (`/status`, `/peers`, `/uptime`, `/containers`, `/restart_N`, `/stop_N`, `/start_N`)
 - **Systemd Notification Service** — Telegram bot runs as a systemd service, survives reboots and TUI exits
 - **Performance Overhaul** — Parallelized docker commands across all TUI screens, reduced refresh from ~10s to ~2-3s
 - **Compact Number Display** — Large counts show as 16.5K, 1.2M
@@ -63,7 +63,7 @@ sudo bash conduit.sh
 - **Advanced Stats** — Top countries by connected peers, download, upload, and unique IPs with bar charts
 - **Live Peer Traffic** — Real-time traffic table by country with speed, total bytes, and IP/client counts
 - **Background Tracker** — Continuous traffic monitoring via systemd service with GeoIP resolution
-- **Telegram Notifications** — Optional periodic status reports and alerts via Telegram bot
+- **Telegram Bot** — On-demand `/status`, `/peers`, `/uptime`, `/containers` and remote container management via Telegram
 - **Per-Container Settings** — Configure max-clients, bandwidth, CPU, and memory per container
 - **Resource Limits** — Set CPU and memory limits with smart defaults based on system specs
 - **Easy Management** — Powerful CLI commands or interactive menu
@@ -260,7 +260,7 @@ sudo bash conduit.sh
 ## تازه‌های نسخه 1.2
 
 - **محدودیت منابع هر کانتینر** — تنظیم محدودیت CPU و حافظه برای هر کانتینر با پیش‌فرض‌های هوشمند
-- **ربات تلگرام** — گزارش‌های دوره‌ای، هشدارها و دستورات مدیریت کانتینر (`/containers`، `/restart_N`، `/stop_N`، `/start_N`)
+- **ربات تلگرام** — گزارش‌های دوره‌ای، هشدارها و دستورات (`/status`، `/peers`، `/uptime`، `/containers`، `/restart_N`، `/stop_N`، `/start_N`)
 - **سرویس اعلان سیستمی** — ربات تلگرام به عنوان سرویس systemd اجرا می‌شود و پس از ریستارت سرور فعال می‌ماند
 - **بهبود عملکرد** — دستورات داکر به صورت موازی اجرا شده، زمان رفرش از ~۱۰ ثانیه به ~۲-۳ ثانیه کاهش یافته
 - **نمایش فشرده اعداد** — اعداد بزرگ به صورت 16.5K و 1.2M نمایش داده می‌شوند
@@ -278,7 +278,7 @@ sudo bash conduit.sh
 - **آمار پیشرفته** — نمودار میله‌ای برترین کشورها بر اساس اتصال، دانلود، آپلود و IP
 - **مانیتورینگ ترافیک** — جدول لحظه‌ای ترافیک بر اساس کشور با سرعت و تعداد کلاینت
 - **ردیاب پس‌زمینه** — سرویس ردیابی مداوم ترافیک با تشخیص جغرافیایی
-- **اعلان‌های تلگرام** — گزارش‌های دوره‌ای و هشدارها از طریق ربات تلگرام (اختیاری)
+- **ربات تلگرام** — دستورات `/status`، `/peers`، `/uptime`، `/containers` و مدیریت کانتینر از راه دور (اختیاری)
 - **تنظیمات هر کانتینر** — پیکربندی حداکثر کاربران، پهنای باند، CPU و حافظه برای هر کانتینر
 - **محدودیت منابع** — تنظیم محدودیت CPU و حافظه با پیش‌فرض‌های هوشمند
 - **مدیریت آسان** — دستورات قدرتمند CLI یا منوی تعاملی
