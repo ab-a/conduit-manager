@@ -1887,6 +1887,11 @@ TRACKER_SCRIPT
 
 # Setup tracker systemd service
 setup_tracker_service() {
+    # Skip if tracker is disabled
+    if [ "${TRACKER_ENABLED:-true}" = "false" ]; then
+        return 0
+    fi
+
     regenerate_tracker_script
 
     if command -v systemctl &>/dev/null; then
@@ -1922,6 +1927,18 @@ stop_tracker_service() {
 
 # Advanced Statistics page with 15-second soft refresh
 show_advanced_stats() {
+    # Check if tracker is disabled
+    if [ "${TRACKER_ENABLED:-true}" = "false" ]; then
+        echo ""
+        echo -e "  ${YELLOW}⚠ Tracker is disabled.${NC}"
+        echo -e "  Advanced stats requires the tracker to capture network traffic."
+        echo ""
+        echo -e "  To enable: Settings & Tools → Toggle tracker (d)"
+        echo ""
+        read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true
+        return
+    fi
+
     local persist_dir="$INSTALL_DIR/traffic_stats"
     local exit_stats=0
     trap 'exit_stats=1' SIGINT SIGTERM
@@ -2171,6 +2188,18 @@ show_advanced_stats() {
 
 # show_peers() - Live peer traffic by country using tcpdump + GeoIP
 show_peers() {
+    # Check if tracker is disabled
+    if [ "${TRACKER_ENABLED:-true}" = "false" ]; then
+        echo ""
+        echo -e "  ${YELLOW}⚠ Tracker is disabled.${NC}"
+        echo -e "  Live peers by country requires the tracker to capture network traffic."
+        echo ""
+        echo -e "  To enable: Settings & Tools → Toggle tracker (d)"
+        echo ""
+        read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true
+        return
+    fi
+
     local stop_peers=0
     trap 'stop_peers=1' SIGINT SIGTERM
 
@@ -4012,6 +4041,7 @@ TELEGRAM_SERVER_LABEL="${TELEGRAM_SERVER_LABEL:-}"
 TELEGRAM_START_HOUR=${TELEGRAM_START_HOUR:-0}
 DOCKER_CPUS=${DOCKER_CPUS:-}
 DOCKER_MEMORY=${DOCKER_MEMORY:-}
+TRACKER_ENABLED=${TRACKER_ENABLED:-true}
 EOF
     # Save per-container overrides
     for i in $(seq 1 5); do
@@ -5118,12 +5148,18 @@ show_settings_menu() {
             echo -e "  8. 📖 About Conduit"
             echo ""
             echo -e "  9. 🔄 Reset tracker data"
-            local tracker_status
+            local tracker_status tracker_enabled_status
             if is_tracker_active; then
                 tracker_status="${GREEN}Active${NC}"
             else
                 tracker_status="${RED}Inactive${NC}"
             fi
+            if [ "${TRACKER_ENABLED:-true}" = "true" ]; then
+                tracker_enabled_status="${GREEN}Enabled${NC}"
+            else
+                tracker_enabled_status="${RED}Disabled${NC}"
+            fi
+            echo -e "  d. 📡 Toggle tracker (${tracker_enabled_status}) — saves CPU when off"
             echo -e "  r. 📡 Restart tracker service  (${tracker_status})"
             echo -e "  t. 📲 Telegram Notifications"
             echo -e ""
@@ -5204,8 +5240,52 @@ show_settings_menu() {
                 read -n 1 -s -r -p "Press any key to return..." < /dev/tty || true
                 redraw=true
                 ;;
+            d|D)
+                echo ""
+                if [ "${TRACKER_ENABLED:-true}" = "true" ]; then
+                    echo -e "  ${YELLOW}⚠ Disabling tracker will stop these features:${NC}"
+                    echo -e "    • Live peers by country"
+                    echo -e "    • Top upload by country in dashboard"
+                    echo -e "    • Advanced stats (country breakdown)"
+                    echo -e "    • Unique IP tracking"
+                    echo ""
+                    echo -e "  ${GREEN}Benefit: Saves ~15-25% CPU on busy servers${NC}"
+                    echo ""
+                    read -p "  Disable tracker? (y/n): " confirm < /dev/tty || true
+                    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                        TRACKER_ENABLED=false
+                        save_settings
+                        stop_tracker_service
+                        echo -e "  ${GREEN}✓ Tracker disabled.${NC}"
+                    else
+                        echo "  Cancelled."
+                    fi
+                else
+                    read -p "  Enable tracker? (y/n): " confirm < /dev/tty || true
+                    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                        TRACKER_ENABLED=true
+                        save_settings
+                        setup_tracker_service
+                        if is_tracker_active; then
+                            echo -e "  ${GREEN}✓ Tracker enabled and running.${NC}"
+                        else
+                            echo -e "  ${YELLOW}Tracker enabled but failed to start. Try 'r' to restart.${NC}"
+                        fi
+                    else
+                        echo "  Cancelled."
+                    fi
+                fi
+                read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true
+                redraw=true
+                ;;
             r)
                 echo ""
+                if [ "${TRACKER_ENABLED:-true}" = "false" ]; then
+                    echo -e "  ${YELLOW}Tracker is disabled. Use 'd' to enable it first.${NC}"
+                    read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true
+                    redraw=true
+                    continue
+                fi
                 echo -ne "  Regenerating tracker script... "
                 regenerate_tracker_script
                 echo -e "${GREEN}done${NC}"
