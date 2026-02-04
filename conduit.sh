@@ -339,6 +339,20 @@ calculate_recommended_clients() {
     fi
 }
 
+get_container_cpus() {
+    local idx=${1:-1}
+    local var="CPUS_${idx}"
+    local val="${!var}"
+    echo "${val:-${DOCKER_CPUS:-}}"
+}
+
+get_container_memory() {
+    local idx=${1:-1}
+    local var="MEMORY_${idx}"
+    local val="${!var}"
+    echo "${val:-${DOCKER_MEMORY:-}}"
+}
+
 #═══════════════════════════════════════════════════════════════════════
 # Interactive Setup
 #═══════════════════════════════════════════════════════════════════════
