@@ -426,18 +426,24 @@ prompt_settings() {
     # Detect CPU cores and RAM for recommendation
     local cpu_cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
     local ram_mb=$(awk '/MemTotal/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 512)
-    local rec_containers=2
+    local ram_gb=$(( ram_mb / 1024 ))
+    local rec_containers=1
     if [ "$cpu_cores" -le 1 ] || [ "$ram_mb" -lt 1024 ]; then
         rec_containers=1
-    elif [ "$cpu_cores" -ge 4 ] && [ "$ram_mb" -ge 4096 ]; then
-        rec_containers=3
+    else
+        # Heuristic: recommend up to 2 containers per CPU core, bounded by RAM in GB.
+        # Big machines (e.g. 64GB bare metal) will naturally get higher recommendations.
+        local rec_by_cpu=$(( cpu_cores * 2 ))
+        local rec_by_ram=$(( ram_gb > 0 ? ram_gb : 1 ))
+        rec_containers=$(( rec_by_cpu < rec_by_ram ? rec_by_cpu : rec_by_ram ))
+        [ "$rec_containers" -lt 1 ] && rec_containers=1
     fi
 
     echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
-    echo -e "  How many Conduit containers to run? (1-5)"
+    echo -e "  How many Conduit containers to run? (1+)"
     echo -e "  More containers = more connections served"
     echo ""
-    echo -e "  ${DIM}System: ${cpu_cores} CPU core(s), ${ram_mb}MB RAM${NC}"
+    echo -e "  ${DIM}System: ${cpu_cores} CPU core(s), ${ram_mb}MB RAM (~${ram_gb}GB)${NC}"
     if [ "$cpu_cores" -le 1 ] || [ "$ram_mb" -lt 1024 ]; then
         echo -e "  ${YELLOW}⚠ Low-end system detected. Recommended: 1 container.${NC}"
         echo -e "  ${YELLOW}  Multiple containers may cause high CPU and instability.${NC}"
@@ -453,8 +459,12 @@ prompt_settings() {
 
     if [ -z "$input_containers" ]; then
         CONTAINER_COUNT=$rec_containers
-    elif [[ "$input_containers" =~ ^[1-5]$ ]]; then
+    elif [[ "$input_containers" =~ ^[1-9][0-9]*$ ]]; then
         CONTAINER_COUNT=$input_containers
+        if [ "$CONTAINER_COUNT" -gt "$rec_containers" ]; then
+            echo -e "  ${YELLOW}Note:${NC} You chose ${CONTAINER_COUNT}, which is above the recommended ${rec_containers}."
+            echo -e "  ${DIM}  This may cause diminishing returns, higher CPU usage, or instability depending on workload.${NC}"
+        fi
     else
         log_warn "Invalid input. Using default: ${rec_containers}"
         CONTAINER_COUNT=$rec_containers
