@@ -3555,20 +3555,19 @@ manage_containers() {
 
         case "$mc_choice" in
             a)
-                if [ "$CONTAINER_COUNT" -ge 5 ]; then
-                    echo -e "  ${RED}Already at maximum (5).${NC}"
-                    read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
-                    continue
-                fi
-                local max_add=$((5 - CONTAINER_COUNT))
-                read -p "  How many to add? (1-${max_add}): " add_count < /dev/tty || true
-                if ! [[ "$add_count" =~ ^[0-9]+$ ]] || [ "$add_count" -lt 1 ] || [ "$add_count" -gt "$max_add" ]; then
+                read -p "  How many to add? (1+): " add_count < /dev/tty || true
+                if ! [[ "$add_count" =~ ^[1-9][0-9]*$ ]]; then
                     echo -e "  ${RED}Invalid.${NC}"
                     read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
                     continue
                 fi
                 local old_count=$CONTAINER_COUNT
                 CONTAINER_COUNT=$((CONTAINER_COUNT + add_count))
+                if [ "$CONTAINER_COUNT" -gt "$rec_containers" ]; then
+                    echo -e "  ${YELLOW}Note:${NC} Total containers (${CONTAINER_COUNT}) exceed recommended (${rec_containers})."
+                    echo -e "  ${DIM}  Expect diminishing returns or higher resource usage.${NC}"
+                fi
+                 ;;
 
                 # Ask if user wants to set resource limits on new containers
                 local set_limits=""
