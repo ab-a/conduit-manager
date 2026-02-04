@@ -2913,13 +2913,16 @@ restart_conduit() {
             fi
         fi
     done
-    # Remove extra containers beyond current count
-    for i in $(seq $((CONTAINER_COUNT + 1)) 5); do
-        local name=$(get_container_name $i)
-        if docker ps -a 2>/dev/null | grep -q "[[:space:]]${name}$"; then
-            docker stop "$name" 2>/dev/null || true
-            docker rm "$name" 2>/dev/null || true
-            echo -e "${YELLOW}✓ ${name} removed (scaled down)${NC}"
+    # Remove extra containers beyond current count (dynamic, no hard max)
+    local c1="$(get_container_name 1)"
+    local cprefix="${c1%1}"
+    docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r cname; do
+        [[ "$cname" =~ ^${cprefix}([0-9]+)$ ]] || continue
+        local idx="${BASH_REMATCH[1]}"
+        if [ "$idx" -gt "$CONTAINER_COUNT" ]; then
+            docker stop "$cname" 2>/dev/null || true
+            docker rm "$cname" 2>/dev/null || true
+            echo -e "${YELLOW}✓ ${cname} removed (scaled down)${NC}"
         fi
     done
     # Stop tracker before backup to avoid racing with writes
@@ -5946,13 +5949,13 @@ _info_containers() {
     echo -e "  ${BOLD}Naming${NC}"
     echo -e "    Container 1: ${CYAN}conduit${NC}      Volume: ${CYAN}conduit-data${NC}"
     echo -e "    Container 2: ${CYAN}conduit-2${NC}    Volume: ${CYAN}conduit-data-2${NC}"
-    echo -e "    Container 3: ${CYAN}conduit-3${NC}    Volume: ${CYAN}conduit-data-3${NC}"
-    echo -e "    ...up to 5 containers."
+    echo -e "    Container N: ${CYAN}conduit-N${NC}    Volume: ${CYAN}conduit-data-N${NC}"
+    echo -e "    (Currently configured: 1–${CONTAINER_COUNT})"
     echo ""
     echo -e "  ${BOLD}Scaling recommendations${NC}"
     echo -e "    ${YELLOW}1 CPU / <1GB RAM:${NC}  Stick with 1 container"
     echo -e "    ${YELLOW}2 CPUs / 2GB RAM:${NC}  1-2 containers"
-    echo -e "    ${GREEN}4+ CPUs / 4GB RAM:${NC} 3-5 containers"
+    echo -e "    ${GREEN}4+ CPUs / 4GB+ RAM:${NC} 3-5+ containers"
     echo -e "  Each container uses ~50MB RAM per 100 clients."
     echo ""
     echo -e "  ${BOLD}Per-container settings${NC}"
@@ -6829,12 +6832,11 @@ SVCEOF
 
     # Step 3: Start Conduit container
     log_info "Step 3/5: Starting Conduit..."
-    # Clean up any existing containers from previous install/scaling
-    docker stop conduit 2>/dev/null || true
-    docker rm -f conduit 2>/dev/null || true
-    for i in 2 3 4 5; do
-        docker stop "conduit-${i}" 2>/dev/null || true
-        docker rm -f "conduit-${i}" 2>/dev/null || true
+    # Clean up any existing Conduit containers from previous install/scaling (dynamic)
+    docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r name; do
+        [[ "$name" =~ ^conduit(-[0-9]+)?$ ]] || continue
+        docker stop "$name" 2>/dev/null || true
+        docker rm -f "$name" 2>/dev/null || true
     done
     run_conduit
     
