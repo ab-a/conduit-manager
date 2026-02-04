@@ -3570,7 +3570,6 @@ manage_containers() {
                     echo -e "  ${YELLOW}Note:${NC} Total containers (${CONTAINER_COUNT}) exceed recommended (${rec_containers})."
                     echo -e "  ${DIM}  Expect diminishing returns or higher resource usage.${NC}"
                 fi
-                 ;;
 
                 # Ask if user wants to set resource limits on new containers
                 local set_limits=""
