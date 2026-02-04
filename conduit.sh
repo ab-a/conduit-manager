@@ -2786,14 +2786,21 @@ stop_conduit() {
             stopped=$((stopped + 1))
         fi
     done
-    # Also stop any extra containers beyond current count (from previous scaling)
-    for i in $(seq $((CONTAINER_COUNT + 1)) 5); do
-        local name=$(get_container_name $i)
-        if docker ps -a 2>/dev/null | grep -q "[[:space:]]${name}$"; then
-            docker stop "$name" 2>/dev/null || true
-            docker rm "$name" 2>/dev/null || true
-            echo -e "${YELLOW}✓ ${name} stopped and removed (extra)${NC}"
-        fi
+    # Also stop/remove any extra Conduit containers beyond current count (from previous scaling)
+    # This avoids hardcoding a max (previously 5) by discovering matching containers dynamically.
+    local base_name="$(get_container_name 1)"
+    local idx
+    docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r cname; do
+        case "$cname" in
+            "${base_name%1}"*)
+                idx="${cname##*[!0-9]}"
+                if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -gt "$CONTAINER_COUNT" ]; then
+                    docker stop "$cname" 2>/dev/null || true
+                    docker rm "$cname" 2>/dev/null || true
+                    echo -e "${YELLOW}✓ ${cname} stopped and removed (extra)${NC}"
+                fi
+                ;;
+        esac
     done
     [ "$stopped" -eq 0 ] && echo -e "${YELLOW}No Conduit containers are running${NC}"
     # Stop background tracker
