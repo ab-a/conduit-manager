@@ -1113,7 +1113,7 @@ show_qr_code() {
         done
         echo ""
         read -p "  Which container? (1-${CONTAINER_COUNT}): " idx < /dev/tty || true
-        if ! [[ "$idx" =~ ^[1-5]$ ]] || [ "$idx" -gt "$CONTAINER_COUNT" ]; then
+        if ! [[ "$idx" =~ ^[1-9][0-9]*$ ]] || [ "$idx" -gt "$CONTAINER_COUNT" ]; then
             echo -e "${RED}  Invalid selection.${NC}"
             return
         fi
@@ -3706,7 +3706,7 @@ manage_containers() {
                 local sc_targets=()
                 if [ "$sc_idx" = "all" ]; then
                     for i in $(seq 1 $CONTAINER_COUNT); do sc_targets+=($i); done
-                elif [[ "$sc_idx" =~ ^[1-5]$ ]] && [ "$sc_idx" -le "$CONTAINER_COUNT" ]; then
+                elif [[ "$sc_idx" =~ ^[1-9][0-9]*$ ]] && [ "$sc_idx" -le "$CONTAINER_COUNT" ]; then
                     sc_targets+=($sc_idx)
                 else
                     echo -e "  ${RED}Invalid.${NC}"
@@ -3784,7 +3784,7 @@ manage_containers() {
                             echo -e "  ${YELLOW}  ${_stop_names[$idx]} was not running${NC}"
                         fi
                     done
-                elif [[ "$sc_idx" =~ ^[1-5]$ ]] && [ "$sc_idx" -le "$CONTAINER_COUNT" ]; then
+                elif [[ "$sc_idx" =~ ^[1-9][0-9]*$ ]] && [ "$sc_idx" -le "$CONTAINER_COUNT" ]; then
                     local name=$(get_container_name $sc_idx)
                     if docker stop -t 3 "$name" 2>/dev/null; then
                         echo -e "  ${YELLOW}✓ ${name} stopped${NC}"
@@ -3809,7 +3809,7 @@ manage_containers() {
                         echo -e "  ${GREEN}✓ Tracker data snapshot saved${NC}"
                     fi
                     for i in $(seq 1 $CONTAINER_COUNT); do xc_targets+=($i); done
-                elif [[ "$sc_idx" =~ ^[1-5]$ ]] && [ "$sc_idx" -le "$CONTAINER_COUNT" ]; then
+                elif [[ "$sc_idx" =~ ^[1-9][0-9]*$ ]] && [ "$sc_idx" -le "$CONTAINER_COUNT" ]; then
                     xc_targets+=($sc_idx)
                 else
                     echo -e "  ${RED}Invalid.${NC}"
@@ -4147,7 +4147,7 @@ If a container gets stuck and is auto-restarted, you will receive an immediate a
 /stop\_N — Stop container N (e.g. /stop\_2)
 /restart\_N — Restart container N (e.g. /restart\_1)
 
-Replace N with the container number (1-5).
+Replace N with the container number (1+).
 
 ━━━━━━━━━━━━━━━━━━━━
 📊 *Your first report:*
@@ -6611,13 +6611,20 @@ uninstall() {
     
     echo ""
     log_info "Stopping Conduit container(s)..."
-    for i in 1 2 3 4 5; do
-        local cname="conduit"
-        local vname="conduit-data"
-        [ "$i" -gt 1 ] && cname="conduit-${i}" && vname="conduit-data-${i}"
-        docker stop "$cname" 2>/dev/null || true
-        docker rm -f "$cname" 2>/dev/null || true
-        docker volume rm "$vname" 2>/dev/null || true
+    local c1="$(get_container_name 1)"
+    local cprefix="${c1%1}"
+    local v1="$(get_volume_name 1)"
+    local vprefix="${v1%1}"
+
+    docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r name; do
+        [[ "$name" =~ ^${cprefix}[0-9]+$ ]] || continue
+        docker stop "$name" 2>/dev/null || true
+        docker rm -f "$name" 2>/dev/null || true
+    done
+
+    docker volume ls --format '{{.Name}}' 2>/dev/null | while read -r vol; do
+        [[ "$vol" =~ ^${vprefix}[0-9]+$ ]] || continue
+        docker volume rm "$vol" 2>/dev/null || true
     done
 
     log_info "Removing Conduit Docker image..."
