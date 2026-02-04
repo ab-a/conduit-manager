@@ -428,15 +428,20 @@ prompt_settings() {
     local ram_mb=$(awk '/MemTotal/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 512)
     local ram_gb=$(( ram_mb / 1024 ))
     local rec_containers=1
+    local rec_cap=32
     if [ "$cpu_cores" -le 1 ] || [ "$ram_mb" -lt 1024 ]; then
         rec_containers=1
     else
-        # Heuristic: recommend up to 2 containers per CPU core, bounded by RAM in GB.
-        # Big machines (e.g. 64GB bare metal) will naturally get higher recommendations.
+        # Heuristic: recommend up to 2 containers per CPU core,
+        # bounded by available RAM in GB.
         local rec_by_cpu=$(( cpu_cores * 2 ))
         local rec_by_ram=$(( ram_gb > 0 ? ram_gb : 1 ))
+    
         rec_containers=$(( rec_by_cpu < rec_by_ram ? rec_by_cpu : rec_by_ram ))
+    
+        # Safety bounds
         [ "$rec_containers" -lt 1 ] && rec_containers=1
+        [ "$rec_containers" -gt "$rec_cap" ] && rec_containers="$rec_cap"
     fi
 
     echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
@@ -2917,8 +2922,8 @@ restart_conduit() {
     local c1="$(get_container_name 1)"
     local cprefix="${c1%1}"
     docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r cname; do
-        [[ "$cname" =~ ^${cprefix}([0-9]+)$ ]] || continue
-        local idx="${BASH_REMATCH[1]}"
+        [[ "$cname" =~ ^conduit(-([0-9]+))?$ ]] || continue
+        local idx="${BASH_REMATCH[2]:-1}"
         if [ "$idx" -gt "$CONTAINER_COUNT" ]; then
             docker stop "$cname" 2>/dev/null || true
             docker rm "$cname" 2>/dev/null || true
@@ -3356,7 +3361,7 @@ uninstall_all() {
     local c1="$(get_container_name 1)"
     local cprefix="${c1%1}"
     docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r name; do
-        [[ "$name" =~ ^${cprefix}[0-9]+$ ]] || continue
+        [[ "$name" =~ ^conduit(-([0-9]+))?$ ]] || continue
         docker stop "$name" 2>/dev/null || true
         docker rm -f "$name" 2>/dev/null || true
     done
@@ -3368,7 +3373,7 @@ uninstall_all() {
     local v1="$(get_volume_name 1)"
     local vprefix="${v1%1}"
     docker volume ls --format '{{.Name}}' 2>/dev/null | while read -r vol; do
-        [[ "$vol" =~ ^${vprefix}[0-9]+$ ]] || continue
+        [[ "$vol" =~ ^conduit-data(-([0-9]+))?$ ]] || continue
         docker volume rm "$vol" 2>/dev/null || true
     done
 
@@ -3685,6 +3690,13 @@ manage_containers() {
                 fi
                 local old_count=$CONTAINER_COUNT
                 CONTAINER_COUNT=$((CONTAINER_COUNT - rm_count))
+                # Cleanup per-container overrides beyond new container count
+                for i in $(seq $((CONTAINER_COUNT + 1)) "$old_count"); do
+                    unset "CPUS_${i}" \
+                          "MEMORY_${i}" \
+                          "MAX_CLIENTS_${i}" \
+                          "BANDWIDTH_${i}" 2>/dev/null || true
+                done
                 save_settings
                 # Remove containers in parallel
                 local _rm_pids=() _rm_names=()
@@ -6619,7 +6631,7 @@ uninstall() {
     local vprefix="${v1%1}"
 
     docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r name; do
-        [[ "$name" =~ ^${cprefix}[0-9]+$ ]] || continue
+        [[ "$name" =~ ^conduit(-([0-9]+))?$ ]] || continue
         docker stop "$name" 2>/dev/null || true
         docker rm -f "$name" 2>/dev/null || true
     done
