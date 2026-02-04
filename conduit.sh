@@ -3509,8 +3509,12 @@ manage_containers() {
 
         echo -e "${EL}"
         echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}${EL}"
-        local max_add=$((5 - CONTAINER_COUNT))
-        [ "$max_add" -gt 0 ] && echo -e "  ${GREEN}[a]${NC} Add container(s)      (max: ${max_add} more)${EL}"
+        local max_add=$(( rec_containers - CONTAINER_COUNT ))
+        if [ "$max_add" -gt 0 ]; then
+            echo -e "  ${GREEN}[a]${NC} Add container(s)      (recommended max: ${rec_containers})${EL}"
+        else
+            echo -e "  ${YELLOW}[a]${NC} Add container(s)      (above recommendation)${EL}"
+        fi
         [ "$CONTAINER_COUNT" -gt 1 ] && echo -e "  ${RED}[r]${NC} Remove container(s)   (min: 1 required)${EL}"
         echo -e "  ${GREEN}[s]${NC} Start a container${EL}"
         echo -e "  ${RED}[t]${NC} Stop a container${EL}"
