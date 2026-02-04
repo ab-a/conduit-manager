@@ -2919,8 +2919,6 @@ restart_conduit() {
         fi
     done
     # Remove extra containers beyond current count (dynamic, no hard max)
-    local c1="$(get_container_name 1)"
-    local cprefix="${c1%1}"
     docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r cname; do
         [[ "$cname" =~ ^conduit(-([0-9]+))?$ ]] || continue
         local idx="${BASH_REMATCH[2]:-1}"
@@ -3358,8 +3356,6 @@ uninstall_all() {
 
     echo ""
     echo -e "${BLUE}[INFO]${NC} Stopping Conduit container(s)..."
-    local c1="$(get_container_name 1)"
-    local cprefix="${c1%1}"
     docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r name; do
         [[ "$name" =~ ^conduit(-([0-9]+))?$ ]] || continue
         docker stop "$name" 2>/dev/null || true
@@ -3370,8 +3366,6 @@ uninstall_all() {
     docker rmi "$CONDUIT_IMAGE" 2>/dev/null || true
 
     echo -e "${BLUE}[INFO]${NC} Removing Conduit data volume(s)..."
-    local v1="$(get_volume_name 1)"
-    local vprefix="${v1%1}"
     docker volume ls --format '{{.Name}}' 2>/dev/null | while read -r vol; do
         [[ "$vol" =~ ^conduit-data(-([0-9]+))?$ ]] || continue
         docker volume rm "$vol" 2>/dev/null || true
@@ -6625,10 +6619,6 @@ uninstall() {
     
     echo ""
     log_info "Stopping Conduit container(s)..."
-    local c1="$(get_container_name 1)"
-    local cprefix="${c1%1}"
-    local v1="$(get_volume_name 1)"
-    local vprefix="${v1%1}"
 
     docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r name; do
         [[ "$name" =~ ^conduit(-([0-9]+))?$ ]] || continue
@@ -6637,7 +6627,7 @@ uninstall() {
     done
 
     docker volume ls --format '{{.Name}}' 2>/dev/null | while read -r vol; do
-        [[ "$vol" =~ ^${vprefix}[0-9]+$ ]] || continue
+        [[ "$vol" =~ ^conduit-data(-([0-9]+))?$ ]] || continue
         docker volume rm "$vol" 2>/dev/null || true
     done
 
