@@ -3027,7 +3027,7 @@ change_settings() {
         # Apply to all = update global defaults and clear per-container overrides
         [ -n "$valid_mc" ] && MAX_CLIENTS="$valid_mc"
         [ -n "$valid_bw" ] && BANDWIDTH="$valid_bw"
-        for i in $(seq 1 5); do
+        for i in $(seq 1 "$CONTAINER_COUNT"); do
             unset "MAX_CLIENTS_${i}" 2>/dev/null || true
             unset "BANDWIDTH_${i}" 2>/dev/null || true
         done
@@ -3105,7 +3105,7 @@ change_resource_limits() {
     if [ "$target" = "c" ] || [ "$target" = "C" ]; then
         DOCKER_CPUS=""
         DOCKER_MEMORY=""
-        for i in $(seq 1 5); do
+        for i in $(seq 1 "$CONTAINER_COUNT"); do
             unset "CPUS_${i}" 2>/dev/null || true
             unset "MEMORY_${i}" 2>/dev/null || true
         done
@@ -3213,7 +3213,7 @@ change_resource_limits() {
     if [ "$target" = "a" ] || [ "$target" = "A" ]; then
         [ -n "$valid_cpus" ] && DOCKER_CPUS="$valid_cpus"
         [ -n "$valid_mem" ] && DOCKER_MEMORY="$valid_mem"
-        for i in $(seq 1 5); do
+        for i in $(seq 1 "$CONTAINER_COUNT"); do
             unset "CPUS_${i}" 2>/dev/null || true
             unset "MEMORY_${i}" 2>/dev/null || true
         done
@@ -3350,8 +3350,10 @@ uninstall_all() {
 
     echo ""
     echo -e "${BLUE}[INFO]${NC} Stopping Conduit container(s)..."
-    for i in $(seq 1 5); do
-        local name=$(get_container_name $i)
+    local c1="$(get_container_name 1)"
+    local cprefix="${c1%1}"
+    docker ps -a --format '{{.Names}}' 2>/dev/null | while read -r name; do
+        [[ "$name" =~ ^${cprefix}[0-9]+$ ]] || continue
         docker stop "$name" 2>/dev/null || true
         docker rm -f "$name" 2>/dev/null || true
     done
@@ -3360,8 +3362,10 @@ uninstall_all() {
     docker rmi "$CONDUIT_IMAGE" 2>/dev/null || true
 
     echo -e "${BLUE}[INFO]${NC} Removing Conduit data volume(s)..."
-    for i in $(seq 1 5); do
-        local vol=$(get_volume_name $i)
+    local v1="$(get_volume_name 1)"
+    local vprefix="${v1%1}"
+    docker volume ls --format '{{.Name}}' 2>/dev/null | while read -r vol; do
+        [[ "$vol" =~ ^${vprefix}[0-9]+$ ]] || continue
         docker volume rm "$vol" 2>/dev/null || true
     done
 
@@ -3434,7 +3438,7 @@ manage_containers() {
 
         echo -e "${EL}"
         echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}${EL}"
-        echo -e "${CYAN}  MANAGE CONTAINERS${NC}    ${GREEN}${CONTAINER_COUNT}${NC}/5  Host networking${EL}"
+        echo -e "${CYAN}  MANAGE CONTAINERS${NC}    ${GREEN}${CONTAINER_COUNT}${NC}  Host networking${EL}"
         echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}${EL}"
         echo -e "${EL}"
 
@@ -3467,7 +3471,7 @@ manage_containers() {
             "#" "Container" "Status" "Clients" "Up" "Down" "CPU" "RAM"
         echo -e "  ${CYAN}─────────────────────────────────────────────────────────${NC}${EL}"
 
-        for ci in $(seq 1 5); do
+        for ci in $(seq 1 "$CONTAINER_COUNT"); do
             local cname=$(get_container_name $ci)
             local status_text status_color
             local c_clients="-" c_up="-" c_down="-" c_cpu="-" c_ram="-"
@@ -4065,7 +4069,7 @@ DOCKER_MEMORY=${DOCKER_MEMORY:-}
 TRACKER_ENABLED=${TRACKER_ENABLED:-true}
 EOF
     # Save per-container overrides
-    for i in $(seq 1 5); do
+    for i in $(seq 1 "$CONTAINER_COUNT"); do
         local mc_var="MAX_CLIENTS_${i}"
         local bw_var="BANDWIDTH_${i}"
         local cpu_var="CPUS_${i}"
@@ -6017,7 +6021,7 @@ show_help() {
     echo "  restart   Restart Conduit container"
     echo "  update    Update to latest Conduit image"
     echo "  settings  Change max-clients/bandwidth"
-    echo "  scale     Scale containers (1-5)"
+    echo "  scale     Scale containers (1+)"
     echo "  backup    Backup Conduit node identity key"
     echo "  restore   Restore Conduit node identity from backup"
     echo "  uninstall Remove everything (container, data, service)"
