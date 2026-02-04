@@ -634,6 +634,35 @@ check_and_offer_backup_restore() {
     done
 }
 
+# Helper: Start/recreate conduit container with current settings
+get_container_max_clients() {
+    local idx=${1:-1}
+    local var="MAX_CLIENTS_${idx}"
+    local val="${!var}"
+    echo "${val:-$MAX_CLIENTS}"
+}
+
+get_container_bandwidth() {
+    local idx=${1:-1}
+    local var="BANDWIDTH_${idx}"
+    local val="${!var}"
+    echo "${val:-$BANDWIDTH}"
+}
+
+get_container_cpus() {
+    local idx=${1:-1}
+    local var="CPUS_${idx}"
+    local val="${!var}"
+    echo "${val:-${DOCKER_CPUS:-}}"
+}
+
+get_container_memory() {
+    local idx=${1:-1}
+    local var="MEMORY_${idx}"
+    local val="${!var}"
+    echo "${val:-${DOCKER_MEMORY:-}}"
+}
+
 run_conduit() {
     local count=${CONTAINER_COUNT:-1}
     log_info "Starting Conduit ($count container(s))..."
@@ -956,35 +985,6 @@ fix_volume_permissions() {
         docker run --rm -v "${vol}:/home/conduit/data" alpine \
             sh -c "chown -R 1000:1000 /home/conduit/data" 2>/dev/null || true
     fi
-}
-
-# Helper: Start/recreate conduit container with current settings
-get_container_max_clients() {
-    local idx=${1:-1}
-    local var="MAX_CLIENTS_${idx}"
-    local val="${!var}"
-    echo "${val:-$MAX_CLIENTS}"
-}
-
-get_container_bandwidth() {
-    local idx=${1:-1}
-    local var="BANDWIDTH_${idx}"
-    local val="${!var}"
-    echo "${val:-$BANDWIDTH}"
-}
-
-get_container_cpus() {
-    local idx=${1:-1}
-    local var="CPUS_${idx}"
-    local val="${!var}"
-    echo "${val:-${DOCKER_CPUS:-}}"
-}
-
-get_container_memory() {
-    local idx=${1:-1}
-    local var="MEMORY_${idx}"
-    local val="${!var}"
-    echo "${val:-${DOCKER_MEMORY:-}}"
 }
 
 run_conduit_container() {
