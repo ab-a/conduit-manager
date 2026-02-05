@@ -480,7 +480,10 @@ prompt_settings() {
         CONTAINER_COUNT=$rec_containers
     elif [[ "$input_containers" =~ ^[1-9][0-9]*$ ]]; then
         CONTAINER_COUNT=$input_containers
-        if [ "$CONTAINER_COUNT" -gt "$rec_containers" ]; then
+        if [ "$CONTAINER_COUNT" -gt 32 ]; then
+            log_warn "Maximum is 32 containers. Setting to 32."
+            CONTAINER_COUNT=32
+        elif [ "$CONTAINER_COUNT" -gt "$rec_containers" ]; then
             echo -e "  ${YELLOW}Note:${NC} You chose ${CONTAINER_COUNT}, which is above the recommended ${rec_containers}."
             echo -e "  ${DIM}  This may cause diminishing returns, higher CPU usage, or instability depending on workload.${NC}"
         fi
