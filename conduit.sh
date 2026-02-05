@@ -3582,7 +3582,10 @@ manage_containers() {
                 fi
                 local old_count=$CONTAINER_COUNT
                 CONTAINER_COUNT=$((CONTAINER_COUNT + add_count))
-                if [ "$CONTAINER_COUNT" -gt "$rec_containers" ]; then
+                if [ "$CONTAINER_COUNT" -gt 32 ]; then
+                    echo -e " ${RED}Maximum is 32 containers. Capping at 32.${NC}"
+                    CONTAINER_COUNT=32
+                elif [ "$CONTAINER_COUNT" -gt "$rec_containers" ]; then
                     echo -e "  ${YELLOW}Note:${NC} Total containers (${CONTAINER_COUNT}) exceed recommended (${rec_containers})."
                     echo -e "  ${DIM}  Expect diminishing returns or higher resource usage.${NC}"
                 fi
